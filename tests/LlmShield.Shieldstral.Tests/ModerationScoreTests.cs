@@ -60,7 +60,7 @@ public class ModerationScoreTests
     }
 
     [Fact]
-    public void ScoresMatchBothReferenceImplementations()
+    public async Task ScoresMatchBothReferenceImplementations()
     {
         string? modelPath = Fixtures.ModelPath;
         if (modelPath is null)
@@ -69,13 +69,13 @@ public class ModerationScoreTests
             return;
         }
 
-        using var moderator = new ShieldstralModerator(modelPath);
+        using var moderator = await ShieldstralModerator.OpenAsync(modelPath);
         double worstNumpy = 0, worstLlamaCpp = 0;
         var failures = new List<string>();
 
         foreach (Case c in LoadCases())
         {
-            ModerationResult result = moderator.Moderate(c.Instruct, c.Query, c.Document);
+            ModerationResult result = await moderator.ModerateAsync(c.Instruct, c.Query, c.Document);
 
             Assert.Equal(c.Tokens, result.PromptTokens);
             // A non-finite logit means something overflowed upstream; the score would
@@ -117,7 +117,7 @@ public class ModerationScoreTests
     /// whatever the score says.
     /// </summary>
     [Fact]
-    public void TheVerdictTokenIsAlwaysYesOrNo()
+    public async Task TheVerdictTokenIsAlwaysYesOrNo()
     {
         string? modelPath = Fixtures.ModelPath;
         if (modelPath is null)
@@ -126,10 +126,10 @@ public class ModerationScoreTests
             return;
         }
 
-        using var moderator = new ShieldstralModerator(modelPath);
+        using var moderator = await ShieldstralModerator.OpenAsync(modelPath);
         foreach (Case c in LoadCases())
         {
-            string piece = moderator.TopVerdictToken(new ModerationRequest(c.Instruct, c.Query, c.Document))
+            string piece = (await moderator.TopVerdictTokenAsync(new ModerationRequest(c.Instruct, c.Query, c.Document)))
                 .Trim().ToLowerInvariant();
             _output.WriteLine($"{c.Name,-22} '{piece}' (reference '{c.TopPiece}')");
             Assert.True(piece is "yes" or "no", $"{c.Name}: expected a yes/no verdict, got '{piece}'");
@@ -138,7 +138,7 @@ public class ModerationScoreTests
     }
 
     [Fact]
-    public void ConfigMatchesThePublishedHyperparameters()
+    public async Task ConfigMatchesThePublishedHyperparameters()
     {
         string? modelPath = Fixtures.ModelPath;
         if (modelPath is null)
@@ -147,7 +147,7 @@ public class ModerationScoreTests
             return;
         }
 
-        using var moderator = new ShieldstralModerator(modelPath, cacheSystemPrompt: false);
+        using var moderator = await ShieldstralModerator.OpenAsync(modelPath, cacheSystemPrompt: false);
         var config = moderator.Config;
 
         // mistralai/Shieldstral-1.0-3B/params.json
@@ -179,7 +179,7 @@ public class ModerationScoreTests
     /// across quantizations that move the whole distribution slightly.
     /// </summary>
     [Fact]
-    public void ScoreIsMonotonicInTheLogitGap()
+    public async Task ScoreIsMonotonicInTheLogitGap()
     {
         string? modelPath = Fixtures.ModelPath;
         if (modelPath is null)
@@ -188,11 +188,12 @@ public class ModerationScoreTests
             return;
         }
 
-        using var moderator = new ShieldstralModerator(modelPath);
-        var results = LoadCases()
-            .Select(c => moderator.Moderate(c.Instruct, c.Query, c.Document))
-            .OrderBy(r => r.YesLogit - r.NoLogit)
-            .ToArray();
+        using var moderator = await ShieldstralModerator.OpenAsync(modelPath);
+        var scored = new List<ModerationResult>();
+        foreach (Case c in LoadCases())
+            scored.Add(await moderator.ModerateAsync(c.Instruct, c.Query, c.Document));
+
+        var results = scored.OrderBy(r => r.YesLogit - r.NoLogit).ToArray();
 
         for (int i = 1; i < results.Length; i++)
             Assert.True(results[i].Score >= results[i - 1].Score,

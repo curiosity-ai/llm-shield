@@ -14,7 +14,7 @@ namespace LlmShield.Shieldstral.Cli;
 /// </summary>
 internal static class Program
 {
-    private static int Main(string[] args)
+    private static async Task<int> Main(string[] args)
     {
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
         {
@@ -26,12 +26,12 @@ internal static class Program
         {
             return args[0] switch
             {
-                "download" => Download(args[1..]),
-                "moderate" => Moderate(args[1..]),
+                "download" => await Download(args[1..]).ConfigureAwait(false),
+                "moderate" => await Moderate(args[1..]).ConfigureAwait(false),
                 "inspect" => Inspect(args[1..]),
                 "tokenize" => Tokenize(args[1..]),
-                "dump" => Dump(args[1..]),
-                "bench" => Benchmark.Run(args[1..]),
+                "dump" => await Dump(args[1..]).ConfigureAwait(false),
+                "bench" => await Benchmark.Run(args[1..]).ConfigureAwait(false),
                 _ => Unknown(args[0]),
             };
         }
@@ -67,16 +67,18 @@ internal static class Program
           download [q5_1|q5_0|q4_0] [--to PATH]          fetch a converted model (resumable)
           moderate <model.gguf> --instruct TEXT --query TEXT --document TEXT [--json]
                                 [--document-file PATH] [--no-prefix-cache] [--prefix-cache PATH]
+                                [--threads N]
           inspect  <model.gguf>                          print metadata and tensor summary
           tokenize <model.gguf> <text>                   print token ids and pieces
           dump     <model.gguf> <prompt-file> <out.json> record activations for parity checks
           bench    [<model.gguf|dir> ...] [--json out.json] [--no-micro] [--no-model]
                    [--prefill-tokens N] [--decode-tokens N] [--warmups N] [--repeats N]
+                   [--threads N]
         """);
 
     // ------------------------------------------------------------- download
 
-    private static int Download(string[] args)
+    private static async Task<int> Download(string[] args)
     {
         var quantization = ShieldstralQuantization.Q5_1;
         string? destination = null;
@@ -108,7 +110,7 @@ internal static class Program
         bool tty = !Console.IsOutputRedirected;
         long lastLine = -1;
 
-        ModelDownloader.EnsureModelAsync(quantization, path, Progress).GetAwaiter().GetResult();
+        await ModelDownloader.EnsureModelAsync(quantization, path, Progress).ConfigureAwait(false);
 
         if (tty) Console.Error.WriteLine();
         Console.WriteLine(path);
@@ -130,7 +132,7 @@ internal static class Program
 
     // ------------------------------------------------------------- moderate
 
-    private static int Moderate(string[] args)
+    private static async Task<int> Moderate(string[] args)
     {
         if (args.Length == 0) { Usage(); return 2; }
         string model = args[0];
@@ -139,6 +141,7 @@ internal static class Program
         string? document = null;
         bool json = false, cache = true;
         string? cachePath = null;
+        int threads = -1;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -150,6 +153,7 @@ internal static class Program
                 case "--document-file": document = File.ReadAllText(Next(args, ref i)); break;
                 case "--prefix-cache": cachePath = Next(args, ref i); break;
                 case "--no-prefix-cache": cache = false; break;
+                case "--threads": threads = int.Parse(Next(args, ref i), CultureInfo.InvariantCulture); break;
                 case "--json": json = true; break;
                 default:
                     Console.Error.WriteLine($"error: unexpected argument '{args[i]}'");
@@ -163,12 +167,14 @@ internal static class Program
             else { Console.Error.WriteLine("error: --document or --document-file is required"); return 2; }
         }
 
+        var options = new ParallelOptions { MaxDegreeOfParallelism = threads };
+
         var sw = Stopwatch.StartNew();
-        using var moderator = new ShieldstralModerator(model, cache, cachePath);
+        using var moderator = await ShieldstralModerator.OpenAsync(model, cache, cachePath, options).ConfigureAwait(false);
         TimeSpan load = sw.Elapsed;
 
         sw.Restart();
-        ModerationResult result = moderator.Moderate(instruct, query, document);
+        ModerationResult result = await moderator.ModerateAsync(instruct, query, document).ConfigureAwait(false);
         TimeSpan elapsed = sw.Elapsed;
 
         if (json)
@@ -273,7 +279,7 @@ internal static class Program
         }
     }
 
-    private static int Dump(string[] args)
+    private static async Task<int> Dump(string[] args)
     {
         if (args.Length < 3) { Usage(); return 2; }
         using var model = new MinistralModel(args[0]);
@@ -282,7 +288,7 @@ internal static class Program
 
         var sink = new JsonActivationSink();
         model.ResetKvCache();
-        float[] logits = model.Forward(tokens, sink).ToArray();
+        float[] logits = (await model.ForwardAsync(tokens, sink, new ParallelOptions()).ConfigureAwait(false)).ToArray();
 
         int[] top20 = [.. Enumerable.Range(0, logits.Length)
             .OrderByDescending(i => logits[i]).Take(20)];

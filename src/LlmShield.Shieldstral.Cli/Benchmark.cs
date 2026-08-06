@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Text;
 using System.Text.Json;
@@ -31,12 +32,12 @@ internal static class Benchmark
     /// <summary>Reference score for <see cref="Document"/> from llama.cpp on Q8_0.</summary>
     private const double ReferenceScore = 0.997343;
 
-    public static int Run(string[] args)
+    public static async Task<int> Run(string[] args)
     {
         var models = new List<string>();
         bool micro = true, endToEnd = true;
         string? jsonPath = null;
-        int decodeTokens = 8, repeats = 5, warmups = 3, prefillTokens = 256;
+        int decodeTokens = 8, repeats = 5, warmups = 3, prefillTokens = 256, threads = -1;
         var strategies = new List<MatMulStrategy>();
 
         for (int i = 0; i < args.Length; i++)
@@ -53,6 +54,7 @@ internal static class Benchmark
                 case "--prefill-tokens": prefillTokens = ParseInt(Next(args, ref i)); break;
                 case "--repeats": repeats = ParseInt(Next(args, ref i)); break;
                 case "--warmups": warmups = ParseInt(Next(args, ref i)); break;
+                case "--threads": threads = ParseInt(Next(args, ref i)); break;
                 case "--strategy":
                     strategies.Add(Enum.Parse<MatMulStrategy>(Next(args, ref i), ignoreCase: true));
                     break;
@@ -67,13 +69,16 @@ internal static class Benchmark
             }
         }
 
+        var options = new ParallelOptions { MaxDegreeOfParallelism = threads };
+
         var report = new Dictionary<string, object> { ["environment"] = Environment_() };
         WriteEnvironment();
+        if (threads > 0) Console.WriteLine($"  capped at {threads} worker(s)");
 
         if (micro)
         {
             report["dequantize"] = DequantizeThroughput();
-            report["matmul"] = MatMulThroughput(repeats);
+            report["matmul"] = await MatMulThroughput(repeats, options).ConfigureAwait(false);
         }
 
         // Both arithmetic paths over the same models in the same process, so the
@@ -85,8 +90,8 @@ internal static class Benchmark
         {
             var sweeps = new Dictionary<string, object>();
             foreach (MatMulStrategy strategy in strategies)
-                sweeps[strategy.ToString()] = ModelSweep(
-                    models, prefillTokens, decodeTokens, warmups, repeats, strategy);
+                sweeps[strategy.ToString()] = await ModelSweep(
+                    models, prefillTokens, decodeTokens, warmups, repeats, strategy, options).ConfigureAwait(false);
             report["models"] = sweeps;
         }
         else if (endToEnd)
@@ -201,7 +206,7 @@ internal static class Benchmark
     /// bound). Accuracy is measured against the float path, which is the one the
     /// model was validated with.
     /// </summary>
-    private static List<Dictionary<string, object>> MatMulThroughput(int repeats)
+    private static async Task<List<Dictionary<string, object>>> MatMulThroughput(int repeats, ParallelOptions options)
     {
         Console.WriteLine();
         Console.WriteLine("matmul: float decode vs integer decode of the weights");
@@ -214,7 +219,7 @@ internal static class Benchmark
         // The first matmul of the process pays JIT, first-touch page faults and a
         // cold branch predictor. Burn that here so it lands on a discarded result
         // rather than on whichever type happens to be measured first.
-        WarmUpMatMul(outputs, inputs);
+        await WarmUpMatMul(outputs, inputs, options).ConfigureAwait(false);
 
         foreach (GgmlType type in (GgmlType[])
                  [GgmlType.Q8_0, GgmlType.Q5_1, GgmlType.Q5_0, GgmlType.Q4_1, GgmlType.Q4_0,
@@ -232,46 +237,48 @@ internal static class Benchmark
                 var yInteger = new float[tokens * outputs];
                 double flops = 2.0 * tokens * outputs * inputs;
 
-                unsafe
+                // The weights are pinned for the whole measurement rather than held under a
+                // `fixed` block: a `fixed` region cannot span an await, and every matmul is
+                // now awaited.
+                var handle = GCHandle.Alloc(weights, GCHandleType.Pinned);
+                try
                 {
-                    fixed (byte* w = weights)
+                    Func<ValueTask> floatWork = MatMulWork(handle, type, outputs, inputs, x, tokens, yFloat, options);
+
+                    QuantMatMul.Strategy = MatMulStrategy.Float;
+                    double floatSeconds = await TimeBestAsync(floatWork, 2, repeats + 2).ConfigureAwait(false);
+
+                    double? integerSeconds = null;
+                    if (IntegerDot.Supports(type))
                     {
-                        var matrix = new WeightMatrix(type, w, outputs, inputs);
-                        float[] target = yFloat;
-
-                        QuantMatMul.Strategy = MatMulStrategy.Float;
-                        double floatSeconds = TimeBest(
-                            () => QuantMatMul.Forward(matrix, x, tokens, target), 2, repeats + 2);
-
-                        double? integerSeconds = null;
-                        if (IntegerDot.Supports(type))
-                        {
-                            float[] targetInteger = yInteger;
-                            QuantMatMul.Strategy = MatMulStrategy.Integer;
-                            integerSeconds = TimeBest(
-                                () => QuantMatMul.Forward(matrix, x, tokens, targetInteger), 2, repeats + 2);
-                        }
-                        QuantMatMul.Strategy = MatMulStrategy.Auto;
-
-                        double floatGflops = flops / floatSeconds / 1e9;
-                        double? integerGflops = integerSeconds is { } s ? flops / s / 1e9 : null;
-                        double? error = integerSeconds is null ? null : RelativeL2(yFloat, yInteger);
-
-                        Console.WriteLine(
-                            $"  {type,-8} {tokens,6} {floatGflops,14:F2} " +
-                            $"{(integerGflops is { } g ? g.ToString("F2", CultureInfo.InvariantCulture) : "-"),13} " +
-                            $"{(integerGflops is { } g2 ? (g2 / floatGflops).ToString("F2", CultureInfo.InvariantCulture) + "x" : "-"),8} " +
-                            $"{(error is { } e ? e.ToString("E2", CultureInfo.InvariantCulture) : "-"),9}");
-
-                        rows.Add(new Dictionary<string, object>
-                        {
-                            ["type"] = type.ToString(),
-                            ["tokens"] = tokens,
-                            ["float_gflops"] = floatGflops,
-                            ["integer_gflops"] = integerGflops as object ?? "",
-                            ["relative_l2_error"] = error as object ?? "",
-                        });
+                        Func<ValueTask> integerWork = MatMulWork(handle, type, outputs, inputs, x, tokens, yInteger, options);
+                        QuantMatMul.Strategy = MatMulStrategy.Integer;
+                        integerSeconds = await TimeBestAsync(integerWork, 2, repeats + 2).ConfigureAwait(false);
                     }
+                    QuantMatMul.Strategy = MatMulStrategy.Auto;
+
+                    double floatGflops = flops / floatSeconds / 1e9;
+                    double? integerGflops = integerSeconds is { } s ? flops / s / 1e9 : null;
+                    double? error = integerSeconds is null ? null : RelativeL2(yFloat, yInteger);
+
+                    Console.WriteLine(
+                        $"  {type,-8} {tokens,6} {floatGflops,14:F2} " +
+                        $"{(integerGflops is { } g ? g.ToString("F2", CultureInfo.InvariantCulture) : "-"),13} " +
+                        $"{(integerGflops is { } g2 ? (g2 / floatGflops).ToString("F2", CultureInfo.InvariantCulture) + "x" : "-"),8} " +
+                        $"{(error is { } e ? e.ToString("E2", CultureInfo.InvariantCulture) : "-"),9}");
+
+                    rows.Add(new Dictionary<string, object>
+                    {
+                        ["type"] = type.ToString(),
+                        ["tokens"] = tokens,
+                        ["float_gflops"] = floatGflops,
+                        ["integer_gflops"] = integerGflops as object ?? "",
+                        ["relative_l2_error"] = error as object ?? "",
+                    });
+                }
+                finally
+                {
+                    handle.Free();
                 }
             }
         }
@@ -318,9 +325,9 @@ internal static class Benchmark
 
     // ------------------------------------------------------------- model sweep
 
-    private static List<Dictionary<string, object>> ModelSweep(
+    private static async Task<List<Dictionary<string, object>>> ModelSweep(
         List<string> models, int prefillTokens, int decodeTokens, int warmups, int repeats,
-        MatMulStrategy strategy)
+        MatMulStrategy strategy, ParallelOptions options)
     {
         QuantMatMul.Strategy = strategy;
         Console.WriteLine();
@@ -335,8 +342,8 @@ internal static class Benchmark
         {
             try
             {
-                Dictionary<string, object> row = BenchmarkModel(
-                    path, prefillTokens, decodeTokens, warmups, repeats);
+                Dictionary<string, object> row = await BenchmarkModel(
+                    path, prefillTokens, decodeTokens, warmups, repeats, options).ConfigureAwait(false);
                 row["strategy"] = strategy.ToString();
                 rows.Add(row);
             }
@@ -361,8 +368,8 @@ internal static class Benchmark
     /// the context growing sample over sample, which would make every repeat slower
     /// than the last for reasons that have nothing to do with the kernel.
     /// </summary>
-    private static Dictionary<string, object> BenchmarkModel(
-        string path, int prefillTokens, int decodeTokens, int warmups, int repeats)
+    private static async Task<Dictionary<string, object>> BenchmarkModel(
+        string path, int prefillTokens, int decodeTokens, int warmups, int repeats, ParallelOptions options)
     {
         long fileBytes = new FileInfo(path).Length;
         long rssBefore = ResidentBytes();
@@ -377,38 +384,39 @@ internal static class Benchmark
 
         // Capturing these also pulls the weights into page cache and gives tiered
         // JIT its first two passes, before anything is recorded.
-        var systemCache = SystemPromptCache.Capture(model, systemPrefix);
-        var promptCache = SystemPromptCache.Capture(model, prompt);
+        var systemCache = await SystemPromptCache.CaptureAsync(model, systemPrefix, options).ConfigureAwait(false);
+        var promptCache = await SystemPromptCache.CaptureAsync(model, prompt, options).ConfigureAwait(false);
 
         int cached = systemCache.TokenCount;
         int forwarded = prompt.Length - cached;
         int[] suffix = prompt[cached..];
 
-        double prefillSeconds = TimeBest(
+        double prefillSeconds = await TimeBestAsync(
             setup: () => systemCache.RestoreInto(model),
-            work: () => model.Forward(suffix),
-            warmups, repeats);
+            work: async () => await model.ForwardAsync(suffix, options).ConfigureAwait(false),
+            warmups, repeats).ConfigureAwait(false);
 
         // Decode: single-token forwards onto a full 256-token context, which is the
         // shape a generative workload runs at.
         promptCache.RestoreInto(model);
-        int next = Kernels.ArgMax(model.Forward(prompt[^1..]));
+        int next = Kernels.ArgMax((await model.ForwardAsync(prompt[^1..], options).ConfigureAwait(false)).Span);
         var single = new int[1] { next };
-        double decodeSeconds = TimeBest(
+        double decodeSeconds = await TimeBestAsync(
             setup: () => promptCache.RestoreInto(model),
-            work: () =>
+            work: async () =>
             {
-                for (int i = 0; i < decodeTokens; i++) model.Forward(single);
+                for (int i = 0; i < decodeTokens; i++) await model.ForwardAsync(single, options).ConfigureAwait(false);
             },
-            warmups, repeats);
+            warmups, repeats).ConfigureAwait(false);
 
         // End-to-end latency of the thing the library is for, cache and all.
-        using var moderator = new ShieldstralModerator(model, ownsModel: false, cacheSystemPrompt: true);
-        double score = moderator.Moderate(Instruct, Query, Document).Score;
-        double requestSeconds = TimeBest(
+        using var moderator = await ShieldstralModerator.OpenAsync(
+            model, ownsModel: false, cacheSystemPrompt: true, options: options).ConfigureAwait(false);
+        double score = (await moderator.ModerateAsync(Instruct, Query, Document).ConfigureAwait(false)).Score;
+        double requestSeconds = await TimeBestAsync(
             setup: null,
-            work: () => moderator.Moderate(Instruct, Query, Document),
-            warmups, repeats);
+            work: async () => await moderator.ModerateAsync(Instruct, Query, Document).ConfigureAwait(false),
+            warmups, repeats).ConfigureAwait(false);
 
         long rssAfter = ResidentBytes();
         long allocated = GC.GetTotalAllocatedBytes(precise: false) - allocBefore;
@@ -485,30 +493,45 @@ internal static class Benchmark
     /// Builds and exercises a throwaway matmul of the same shape so the JIT, the
     /// array pool and the page tables are all warm before anything is recorded.
     /// </summary>
-    private static void WarmUpMatMul(int outputs, int inputs)
+    private static async Task WarmUpMatMul(int outputs, int inputs, ParallelOptions options)
     {
         foreach (GgmlType type in (GgmlType[])[GgmlType.Q8_0, GgmlType.Q4_0, GgmlType.Q4_K, GgmlType.F32])
         {
             byte[] weights = SynthesiseWeights(type, outputs, inputs);
             var x = new float[64 * inputs];
             var y = new float[64 * outputs];
-            unsafe
+
+            var handle = GCHandle.Alloc(weights, GCHandleType.Pinned);
+            try
             {
-                fixed (byte* w = weights)
+                foreach (MatMulStrategy strategy in (MatMulStrategy[])
+                         [MatMulStrategy.Float, MatMulStrategy.Integer])
                 {
-                    var matrix = new WeightMatrix(type, w, outputs, inputs);
-                    foreach (MatMulStrategy strategy in (MatMulStrategy[])
-                             [MatMulStrategy.Float, MatMulStrategy.Integer])
-                    {
-                        if (strategy == MatMulStrategy.Integer && !IntegerDot.Supports(type)) continue;
-                        QuantMatMul.Strategy = strategy;
-                        QuantMatMul.Forward(matrix, x, 1, y);
-                        QuantMatMul.Forward(matrix, x, 64, y);
-                    }
+                    if (strategy == MatMulStrategy.Integer && !IntegerDot.Supports(type)) continue;
+                    QuantMatMul.Strategy = strategy;
+                    await MatMulWork(handle, type, outputs, inputs, x, 1, y, options)().ConfigureAwait(false);
+                    await MatMulWork(handle, type, outputs, inputs, x, 64, y, options)().ConfigureAwait(false);
                 }
+            }
+            finally
+            {
+                handle.Free();
             }
         }
         QuantMatMul.Strategy = MatMulStrategy.Auto;
+    }
+
+    /// <summary>
+    /// One timed matmul, closed over a weight matrix built from an already-pinned
+    /// buffer. The pointer lives in the closure rather than in the async method, so
+    /// the measurement can await without a `fixed` region having to stay open.
+    /// </summary>
+    private static unsafe Func<ValueTask> MatMulWork(
+        GCHandle pinnedWeights, GgmlType type, int outputs, int inputs,
+        float[] x, int tokens, float[] destination, ParallelOptions options)
+    {
+        var matrix = new WeightMatrix(type, (byte*)pinnedWeights.AddrOfPinnedObject(), outputs, inputs);
+        return () => QuantMatMul.ForwardAsync(matrix, x, tokens, destination, options);
     }
 
     /// <summary>Each timed sample is stretched to at least this long.</summary>
@@ -543,6 +566,27 @@ internal static class Benchmark
         return best;
     }
 
+    /// <summary>Same, for work that is awaited — everything that goes through a matmul.</summary>
+    private static async Task<double> TimeBestAsync(Func<ValueTask> work, int warmups, int repeats)
+    {
+        for (int i = 0; i < warmups; i++) await work().ConfigureAwait(false);
+
+        var probe = Stopwatch.StartNew();
+        await work().ConfigureAwait(false);
+        double single = probe.Elapsed.TotalSeconds;
+        int inner = single <= 0 ? 1
+            : Math.Clamp((int)(MinimumSample.TotalSeconds / single), 1, 10_000);
+
+        double best = double.MaxValue;
+        for (int i = 0; i < Math.Max(1, repeats); i++)
+        {
+            var sw = Stopwatch.StartNew();
+            for (int k = 0; k < inner; k++) await work().ConfigureAwait(false);
+            best = Math.Min(best, sw.Elapsed.TotalSeconds / inner);
+        }
+        return best;
+    }
+
     /// <summary>
     /// Fastest of <paramref name="repeats"/> samples, with <paramref name="setup"/>
     /// run untimed before each one.
@@ -551,16 +595,16 @@ internal static class Benchmark
     /// operations already take seconds, and the setup has to run once per sample to
     /// put the model back in a comparable state.
     /// </summary>
-    private static double TimeBest(Action? setup, Action work, int warmups, int repeats)
+    private static async Task<double> TimeBestAsync(Action? setup, Func<ValueTask> work, int warmups, int repeats)
     {
-        for (int i = 0; i < warmups; i++) { setup?.Invoke(); work(); }
+        for (int i = 0; i < warmups; i++) { setup?.Invoke(); await work().ConfigureAwait(false); }
 
         double best = double.MaxValue;
         for (int i = 0; i < Math.Max(1, repeats); i++)
         {
             setup?.Invoke();
             var sw = Stopwatch.StartNew();
-            work();
+            await work().ConfigureAwait(false);
             best = Math.Min(best, sw.Elapsed.TotalSeconds);
         }
         return best;

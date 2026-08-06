@@ -21,7 +21,7 @@ namespace LlmShield.Shieldstral.Model;
 /// Not thread-safe: an instance owns one KV cache and one logits buffer. Use one
 /// instance per concurrent request, or serialise calls.
 /// </summary>
-public sealed unsafe class MinistralModel : IDisposable
+public sealed class MinistralModel : IDisposable
 {
     private sealed class Layer
     {
@@ -44,7 +44,6 @@ public sealed unsafe class MinistralModel : IDisposable
     private readonly VectorParameter _outputNorm;
     private readonly Rope _rope;
     private readonly float[] _logits;
-    private readonly float[][] _scoreScratch;   // one per attention head
 
     public ModelConfig Config { get; }
     public TekkenTokenizer Tokenizer { get; }
@@ -100,7 +99,6 @@ public sealed unsafe class MinistralModel : IDisposable
 
             KvCache = new KvCache(Config.LayerCount, Config.KvHeadCount, Config.HeadDim, initialCacheCapacity);
             _logits = new float[Config.VocabSize];
-            _scoreScratch = new float[Config.HeadCount][];
         }
         catch
         {
@@ -128,10 +126,18 @@ public sealed unsafe class MinistralModel : IDisposable
 
     /// <summary>
     /// Appends <paramref name="tokens"/> to whatever is already cached and returns
-    /// the logits for the final position. The returned span is reused between
+    /// the logits for the final position. The returned memory is reused between
     /// calls — copy it if you need to keep it.
+    /// <para>
+    /// <paramref name="options"/> is handed straight to the row-parallel matmuls
+    /// and the per-head attention loop, which between them are the only work this
+    /// spreads across cores. Pass one with a bounded
+    /// <see cref="ParallelOptions.MaxDegreeOfParallelism"/> to leave the rest of
+    /// the machine alone.
+    /// </para>
     /// </summary>
-    public ReadOnlySpan<float> Forward(ReadOnlySpan<int> tokens) => Forward(tokens, capture: null);
+    public ValueTask<ReadOnlyMemory<float>> ForwardAsync(ReadOnlyMemory<int> tokens, ParallelOptions options)
+        => ForwardAsync(tokens, capture: null, options);
 
     /// <summary>
     /// Runs <paramref name="tokens"/> through the model for their KV state only,
@@ -139,17 +145,21 @@ public sealed unsafe class MinistralModel : IDisposable
     /// will look at — for Shieldstral that is the fixed system prompt, where the
     /// head would otherwise be a third of the work for a discarded result.
     /// </summary>
-    public void Prefill(ReadOnlySpan<int> tokens) => Forward(tokens, capture: null, computeLogits: false);
+    public async ValueTask PrefillAsync(ReadOnlyMemory<int> tokens, ParallelOptions options)
+        => await ForwardAsync(tokens, capture: null, options, computeLogits: false).ConfigureAwait(false);
 
     /// <summary>
     /// Forward pass with an optional observer for intermediate tensors, used by
     /// the parity tests to diff every layer against the Python reference.
     /// </summary>
-    public ReadOnlySpan<float> Forward(ReadOnlySpan<int> tokens, IActivationSink? capture)
-        => Forward(tokens, capture, computeLogits: true);
+    public ValueTask<ReadOnlyMemory<float>> ForwardAsync(
+        ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options)
+        => ForwardAsync(tokens, capture, options, computeLogits: true);
 
-    private ReadOnlySpan<float> Forward(ReadOnlySpan<int> tokens, IActivationSink? capture, bool computeLogits)
+    private async ValueTask<ReadOnlyMemory<float>> ForwardAsync(
+        ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options, bool computeLogits)
     {
+        ArgumentNullException.ThrowIfNull(options);
         if (tokens.Length == 0) throw new ArgumentException("No tokens to forward.", nameof(tokens));
 
         int seq = tokens.Length;
@@ -167,39 +177,39 @@ public sealed unsafe class MinistralModel : IDisposable
         float[] up = ArrayPool<float>.Shared.Rent(seq * ff);
         try
         {
-            Span<float> h = states.AsSpan(0, seq * hidden);
-            Span<float> norm = normed.AsSpan(0, seq * hidden);
-            Span<float> scratch = block.AsSpan(0, seq * hidden);
+            Memory<float> h = states.AsMemory(0, seq * hidden);
+            Memory<float> norm = normed.AsMemory(0, seq * hidden);
+            Memory<float> scratch = block.AsMemory(0, seq * hidden);
+            Memory<float> g = gate.AsMemory(0, seq * ff);
+            Memory<float> u = up.AsMemory(0, seq * ff);
 
-            QuantMatMul.GatherRows(_tokenEmbeddings, tokens, h);
-            capture?.Observe("embeddings", h, seq, hidden);
+            QuantMatMul.GatherRows(_tokenEmbeddings, tokens.Span, h.Span);
+            capture?.Observe("embeddings", h.Span, seq, hidden);
 
             for (int l = 0; l < Config.LayerCount; l++)
             {
                 Layer layer = _layers[l];
 
-                NormRows(h, layer.AttentionNorm, norm, seq, hidden);
-                capture?.Observe($"blk.{l}.attn_norm", norm, seq, hidden);
+                NormRows(h.Span, layer.AttentionNorm, norm.Span, seq, hidden);
+                capture?.Observe($"blk.{l}.attn_norm", norm.Span, seq, hidden);
 
-                Attention(layer, l, norm, queries, scratch, seq, startPos, capture);
-                capture?.Observe($"blk.{l}.attn_out", scratch, seq, hidden);
+                await AttentionAsync(layer, l, norm, queries, scratch, seq, startPos, capture, options).ConfigureAwait(false);
+                capture?.Observe($"blk.{l}.attn_out", scratch.Span, seq, hidden);
 
-                Kernels.Add(h, scratch);
-                capture?.Observe($"blk.{l}.post_attn", h, seq, hidden);
+                Kernels.Add(h.Span, scratch.Span);
+                capture?.Observe($"blk.{l}.post_attn", h.Span, seq, hidden);
 
-                NormRows(h, layer.FfnNorm, norm, seq, hidden);
-                capture?.Observe($"blk.{l}.ffn_norm", norm, seq, hidden);
+                NormRows(h.Span, layer.FfnNorm, norm.Span, seq, hidden);
+                capture?.Observe($"blk.{l}.ffn_norm", norm.Span, seq, hidden);
 
-                Span<float> g = gate.AsSpan(0, seq * ff);
-                Span<float> u = up.AsSpan(0, seq * ff);
-                QuantMatMul.Forward(layer.Gate, norm, seq, g);
-                QuantMatMul.Forward(layer.Up, norm, seq, u);
-                Kernels.SwiGlu(g, u, g);
-                QuantMatMul.Forward(layer.Down, g, seq, scratch);
-                capture?.Observe($"blk.{l}.ffn_out", scratch, seq, hidden);
+                await QuantMatMul.ForwardAsync(layer.Gate, norm, seq, g, options).ConfigureAwait(false);
+                await QuantMatMul.ForwardAsync(layer.Up, norm, seq, u, options).ConfigureAwait(false);
+                Kernels.SwiGlu(g.Span, u.Span, g.Span);
+                await QuantMatMul.ForwardAsync(layer.Down, g, seq, scratch, options).ConfigureAwait(false);
+                capture?.Observe($"blk.{l}.ffn_out", scratch.Span, seq, hidden);
 
-                Kernels.Add(h, scratch);
-                capture?.Observe($"blk.{l}.output", h, seq, hidden);
+                Kernels.Add(h.Span, scratch.Span);
+                capture?.Observe($"blk.{l}.output", h.Span, seq, hidden);
             }
 
             KvCache.Advance(seq);
@@ -208,12 +218,12 @@ public sealed unsafe class MinistralModel : IDisposable
             // Only the last position feeds the LM head: Shieldstral's verdict is a
             // single token, and the head is a 131072-row matmul we would rather not
             // run once per prompt token.
-            Span<float> last = norm[..hidden];
-            Kernels.RmsNorm(h.Slice((seq - 1) * hidden, hidden), _outputNorm, Config.RmsNormEps, last);
-            capture?.Observe("final_norm", last, 1, hidden);
+            Memory<float> last = norm[..hidden];
+            Kernels.RmsNorm(h.Span.Slice((seq - 1) * hidden, hidden), _outputNorm, Config.RmsNormEps, last.Span);
+            capture?.Observe("final_norm", last.Span, 1, hidden);
 
             WeightMatrix head = _lmHead.IsEmpty ? _tokenEmbeddings : _lmHead;
-            QuantMatMul.Forward(head, last, _logits);
+            await QuantMatMul.ForwardAsync(head, last, _logits, options).ConfigureAwait(false);
             capture?.Observe("logits", _logits, 1, Config.VocabSize);
 
             return _logits;
@@ -238,48 +248,35 @@ public sealed unsafe class MinistralModel : IDisposable
     }
 
     /// <param name="output">Receives the attention block's contribution, seq × hidden.</param>
-    private void Attention(
-        Layer layer, int layerIndex, ReadOnlySpan<float> input,
-        float[] queryBuffer, Span<float> output, int seq, int startPos, IActivationSink? capture)
+    private async ValueTask AttentionAsync(
+        Layer layer, int layerIndex, ReadOnlyMemory<float> input,
+        float[] queryBuffer, Memory<float> output, int seq, int startPos,
+        IActivationSink? capture, ParallelOptions options)
     {
         int heads = Config.HeadCount, kvHeads = Config.KvHeadCount, headDim = Config.HeadDim;
-        int group = Config.GroupSize, kvDim = Config.KvDim, qDim = Config.QDim, hidden = Config.HiddenSize;
+        int group = Config.GroupSize, kvDim = Config.KvDim, qDim = Config.QDim;
         float scale = 1f / MathF.Sqrt(headDim);
         int cacheLength = startPos + seq;
 
-        Span<float> q = queryBuffer.AsSpan(0, seq * qDim);
-        QuantMatMul.Forward(layer.Q, input, seq, q);
-        for (int t = 0; t < seq; t++)
-        {
-            Span<float> row = q.Slice(t * qDim, qDim);
-            _rope.Apply(row, heads, headDim, startPos + t);
-            ApplyPositionScale(row, startPos + t);
-        }
-        capture?.Observe($"blk.{layerIndex}.q_rope", q, seq, qDim);
+        Memory<float> q = queryBuffer.AsMemory(0, seq * qDim);
+        await QuantMatMul.ForwardAsync(layer.Q, input, seq, q, options).ConfigureAwait(false);
+        RotateQueries(q.Span, heads, headDim, qDim, seq, startPos);
+        capture?.Observe($"blk.{layerIndex}.q_rope", q.Span, seq, qDim);
 
         // K and V land straight in their cache slots, so the cache always holds
         // post-RoPE keys exactly as the score loop will read them back.
         float[] staging = ArrayPool<float>.Shared.Rent(seq * kvDim);
         try
         {
-            Span<float> kv = staging.AsSpan(0, seq * kvDim);
+            Memory<float> kv = staging.AsMemory(0, seq * kvDim);
 
-            QuantMatMul.Forward(layer.K, input, seq, kv);
-            for (int t = 0; t < seq; t++)
-            {
-                Span<float> row = kv.Slice(t * kvDim, kvDim);
-                _rope.Apply(row, kvHeads, headDim, startPos + t);
-                for (int kh = 0; kh < kvHeads; kh++)
-                    row.Slice(kh * headDim, headDim).CopyTo(KvCache.Key(layerIndex, kh, startPos + t));
-            }
-            capture?.Observe($"blk.{layerIndex}.k_rope", kv, seq, kvDim);
+            await QuantMatMul.ForwardAsync(layer.K, input, seq, kv, options).ConfigureAwait(false);
+            StoreKeys(kv.Span, layerIndex, kvHeads, headDim, kvDim, seq, startPos);
+            capture?.Observe($"blk.{layerIndex}.k_rope", kv.Span, seq, kvDim);
 
-            QuantMatMul.Forward(layer.V, input, seq, kv);
-            for (int t = 0; t < seq; t++)
-                for (int kh = 0; kh < kvHeads; kh++)
-                    kv.Slice(t * kvDim + kh * headDim, headDim)
-                        .CopyTo(KvCache.Value(layerIndex, kh, startPos + t));
-            capture?.Observe($"blk.{layerIndex}.v", kv, seq, kvDim);
+            await QuantMatMul.ForwardAsync(layer.V, input, seq, kv, options).ConfigureAwait(false);
+            StoreValues(kv.Span, layerIndex, kvHeads, headDim, kvDim, seq, startPos);
+            capture?.Observe($"blk.{layerIndex}.v", kv.Span, seq, kvDim);
         }
         finally
         {
@@ -293,23 +290,19 @@ public sealed unsafe class MinistralModel : IDisposable
         float[] contextBuffer = ArrayPool<float>.Shared.Rent(seq * qDim);
         try
         {
-            Span<float> context = contextBuffer.AsSpan(0, seq * qDim);
+            Memory<float> context = contextBuffer.AsMemory(0, seq * qDim);
+            KvCache cache = KvCache;
 
-            // Grouped-query attention. Heads are independent, so each gets its own
-            // scores buffer and no synchronisation is needed.
-            fixed (float* qp = q)
-            fixed (float* cp = context)
+            // Grouped-query attention. Heads are independent, so each rents its own
+            // scores buffer for the duration and no synchronisation is needed. The
+            // pool is what makes that free: a per-head cache on the model would have
+            // to be sized for the widest fan-out any caller ever asks for, and would
+            // pin every one of those buffers for the model's lifetime.
+            await Parallel.ForAsync(0, heads, options, (head, _) =>
             {
-                float* queryBase = qp, contextBase = cp;
-                KvCache cache = KvCache;
-                float[][] scratch = _scoreScratch;
-
-                Parallel.For(0, heads, head =>
+                float[] scores = ArrayPool<float>.Shared.Rent(cacheLength);
+                try
                 {
-                    float[] scores = scratch[head];
-                    if (scores is null || scores.Length < cacheLength)
-                        scores = scratch[head] = new float[Math.Max(cacheLength, 256)];
-
                     int kvHead = head / group;
                     ReadOnlySpan<float> keys = cache.KeyHistory(layerIndex, kvHead, cacheLength);
                     ReadOnlySpan<float> values = cache.ValueHistory(layerIndex, kvHead, cacheLength);
@@ -317,13 +310,13 @@ public sealed unsafe class MinistralModel : IDisposable
                     for (int t = 0; t < seq; t++)
                     {
                         int limit = startPos + t + 1;                      // causal mask
-                        var query = new ReadOnlySpan<float>(queryBase + t * qDim + head * headDim, headDim);
+                        ReadOnlySpan<float> query = q.Span.Slice(t * qDim + head * headDim, headDim);
                         Span<float> row = scores.AsSpan(0, limit);
                         for (int p = 0; p < limit; p++)
                             row[p] = Kernels.Dot(query, keys.Slice(p * headDim, headDim)) * scale;
                         Kernels.Softmax(row);
 
-                        var sink = new Span<float>(contextBase + t * qDim + head * headDim, headDim);
+                        Span<float> sink = context.Span.Slice(t * qDim + head * headDim, headDim);
                         sink.Clear();
                         for (int p = 0; p < limit; p++)
                         {
@@ -331,16 +324,52 @@ public sealed unsafe class MinistralModel : IDisposable
                             if (w != 0f) Kernels.AddScaled(sink, values.Slice(p * headDim, headDim), w);
                         }
                     }
-                });
-            }
-            capture?.Observe($"blk.{layerIndex}.attn_weighted", context, seq, qDim);
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(scores);
+                }
 
-            QuantMatMul.Forward(layer.O, context, seq, output);
+                return ValueTask.CompletedTask;
+            }).ConfigureAwait(false);
+
+            capture?.Observe($"blk.{layerIndex}.attn_weighted", context.Span, seq, qDim);
+
+            await QuantMatMul.ForwardAsync(layer.O, context, seq, output, options).ConfigureAwait(false);
         }
         finally
         {
             ArrayPool<float>.Shared.Return(contextBuffer);
         }
+    }
+
+    private void RotateQueries(Span<float> q, int heads, int headDim, int qDim, int seq, int startPos)
+    {
+        for (int t = 0; t < seq; t++)
+        {
+            Span<float> row = q.Slice(t * qDim, qDim);
+            _rope.Apply(row, heads, headDim, startPos + t);
+            ApplyPositionScale(row, startPos + t);
+        }
+    }
+
+    private void StoreKeys(Span<float> kv, int layerIndex, int kvHeads, int headDim, int kvDim, int seq, int startPos)
+    {
+        for (int t = 0; t < seq; t++)
+        {
+            Span<float> row = kv.Slice(t * kvDim, kvDim);
+            _rope.Apply(row, kvHeads, headDim, startPos + t);
+            for (int kh = 0; kh < kvHeads; kh++)
+                row.Slice(kh * headDim, headDim).CopyTo(KvCache.Key(layerIndex, kh, startPos + t));
+        }
+    }
+
+    private void StoreValues(Span<float> kv, int layerIndex, int kvHeads, int headDim, int kvDim, int seq, int startPos)
+    {
+        for (int t = 0; t < seq; t++)
+            for (int kh = 0; kh < kvHeads; kh++)
+                kv.Slice(t * kvDim + kh * headDim, headDim)
+                    .CopyTo(KvCache.Value(layerIndex, kh, startPos + t));
     }
 
     /// <summary>
