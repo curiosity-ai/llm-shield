@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/LlmShield.Shieldstral/LlmShield.Shieldstral.csproj" />
+  <Project Path="src/LlmShield.Shieldstral.Cli/LlmShield.Shieldstral.Cli.csproj" />
+  <Project Path="tests/LlmShield.Shieldstral.Tests/LlmShield.Shieldstral.Tests.csproj" />
+</Solution>

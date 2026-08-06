@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>LlmShield.Shieldstral.Cli</RootNamespace>
+    <AssemblyName>shieldstral</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../LlmShield.Shieldstral/LlmShield.Shieldstral.csproj" />
+  </ItemGroup>
+
+</Project>
