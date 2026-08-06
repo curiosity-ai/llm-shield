@@ -95,9 +95,12 @@ dotnet test                                          # no weights needed
 SHIELDSTRAL_MODEL=/path/to/model.gguf dotnet test    # + model-backed parity
 ```
 
-Tests that change `QuantMatMul.Strategy` must restore it — it is process-wide, so
-a leaked setting silently changes every later test in the run. `IntegerDotTests`
-does it in `Dispose`; `KernelTests` uses a `try`/`finally`.
+Tests that change `QuantMatMul.Strategy` must join
+`[Collection(MatMulStrategyCollection.Name)]` *and* restore it. The strategy is
+process-wide and xunit runs test classes in parallel, so restoring alone is not
+enough — one class pinning it to Float while another pins it to Integer makes both
+measure whatever the scheduler left behind, and it fails intermittently, which is
+worse than failing. The collection disables parallelism between them.
 
 `SHIELDSTRAL_MODEL` may be a `.gguf` or a directory to search. Model-backed tests
 write a line explaining the skip and pass when it is unset — keep that pattern
