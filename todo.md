@@ -32,7 +32,7 @@ Reading is complete. Writing is the converter's job and covers what the referenc
 | legacy | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1 | [x] | parity + synthetic blocks |
 | k-quant | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K | [x] | parity + synthetic blocks |
 | i-quant | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS | [x] | parity + synthetic blocks |
-| ternary | TQ1_0, TQ2_0 | [x] | parity + synthetic blocks |
+| ternary | TQ1_0, TQ2_0 | [x] read only | parity + synthetic blocks |
 | microscaling | MXFP4 | [x] | parity + synthetic blocks |
 
 - [x] i-quant codebooks generated from the reference package rather than
@@ -58,7 +58,10 @@ Reading is complete. Writing is the converter's job and covers what the referenc
 - [x] Tekken vocabulary → GGUF tokens/types + derived merge table
 - [x] YaRN and llama-4 metadata written under llama.cpp's key names
 - [x] Pixtral vision tower → `mmproj` GGUF (`--vision`)
-- [x] Output types: f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, tq1_0, tq2_0, mxfp4
+- [x] Output types: f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, mxfp4
+- [x] Ternary (TQ1_0/TQ2_0) removed as a conversion target: post-hoc ternary
+      quantization scored 0.031 where every other build scores 0.997. Still
+      readable, just not producible here.
 
 ## 6. Model
 

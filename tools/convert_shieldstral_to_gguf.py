@@ -33,6 +33,12 @@ VISION_ARCH = "clip"
 
 # gguf-py can only *write* these; the k-quants and i-quants are read-only there
 # (and in this repo's C# writer). Reading every GGUF type is separately covered.
+#
+# TQ1_0 and TQ2_0 are deliberately absent. They quantize to ternary weights, which
+# only works for models trained for it — applied post-hoc to Shieldstral, TQ2_0
+# produced the smallest file in the sweep (0.83 GiB) and scored 0.031 on a case
+# every other build scores 0.997 on. The runtime still *reads* both, so a ternary
+# GGUF from elsewhere loads fine; there is just no way to make a broken one here.
 OUT_TYPES = {
     "f32": GGMLQuantizationType.F32,
     "f16": GGMLQuantizationType.F16,
@@ -42,8 +48,6 @@ OUT_TYPES = {
     "q5_0": GGMLQuantizationType.Q5_0,
     "q4_1": GGMLQuantizationType.Q4_1,
     "q4_0": GGMLQuantizationType.Q4_0,
-    "tq2_0": GGMLQuantizationType.TQ2_0,
-    "tq1_0": GGMLQuantizationType.TQ1_0,
     "mxfp4": GGMLQuantizationType.MXFP4,
 }
 

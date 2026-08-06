@@ -58,7 +58,7 @@ python3 tools/convert_shieldstral_to_gguf.py models/shieldstral --outtype q8_0 -
 
 That writes `Shieldstral-1.0-3B-Q8_0.gguf` (3.4 GiB) and, with `--vision`, the
 Pixtral tower as a separate `mmproj` file. `--outtype` accepts `f32`, `f16`,
-`bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `tq1_0`, `tq2_0` and `mxfp4`.
+`bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0` and `mxfp4`.
 
 A GGUF produced by `llama.cpp`'s `convert_hf_to_gguf.py --mistral-format` loads
 too — the metadata keys and tensor names are the same.
@@ -196,30 +196,36 @@ for the `violent-request` reference case, where llama.cpp gives **0.997343**.
 | Q4_1 | 2.00 GiB | 7.2 → **8.0** | 0.81 → **1.05** | 2.3 GiB | 0.996204 → **0.996366** |
 | Q4_0 | 1.80 GiB | 7.0 → **10.5** | 0.83 → **1.17** | 2.1 GiB | 0.998687 → **0.998754** |
 | MXFP4 | 1.70 GiB | 7.1 → 7.0 | 0.92 → 0.92 | 2.0 GiB | 0.994321 |
-| TQ2_0 | 0.83 GiB | 7.2 → 6.9 | 0.67 → 0.66 | 1.2 GiB | **0.030626** |
 
 Managed allocation is ~220 MiB per run regardless of build: the weights are
 memory-mapped, so RSS tracks the file size and is page cache the kernel can
 reclaim, not private memory the process is holding.
 
-Three things worth reading off that table:
+Two things worth reading off that table:
 
 - **The integer path is worth keeping.** 1.07–1.52× on prefill and 1.15–3.22× on
-  decode for the five types it covers, and the two it does not are unchanged —
-  they fall through to float, as intended. The verdict moves by at most 2e-4,
-  which is an order of magnitude below the difference between two quantizations
-  of the same weights.
+  decode for the five types it covers, and MXFP4 — which it has no kernel for —
+  is unchanged, falling through to float as intended. The verdict moves by at most
+  2e-4, an order of magnitude below the difference between two quantizations of
+  the same weights.
 - **Under the float path, throughput barely depends on model size.** Every build
-  prefills at ~7 tok/s whether it is 0.83 GiB or 3.40 GiB, because the cost is
+  prefills at ~7 tok/s whether it is 1.70 GiB or 3.40 GiB, because the cost is
   decoding weights to float, not fetching them. That is exactly the bound the
   integer path removes, and it is why Q8_0 — the *largest* build, but the cheapest
   to decode — is the fastest at decode once it stops decoding at all (3.16 tok/s,
   from a `DotPackedQ8_0` kernel that reads the packed row in place).
-- **TQ2_0 is a size record and a broken classifier.** At 0.83 GiB it scores 0.031
-  where every other build says 0.997: ternary quantization is meant for models
-  trained for it, and applying it post-hoc destroys this one. It is in the table
-  because "it loads and runs" is not the same as "it works", and a sweep that
-  only reported tok/s would have hidden that.
+
+### Why there is no ternary build
+
+The sweep originally included TQ2_0. At 0.83 GiB it was by some way the smallest
+file — and it scored **0.031** on a case every other build scores 0.997 on.
+Ternary quantization is for models trained for it; applied after the fact to
+Shieldstral it does not preserve a usable classifier. `--outtype` no longer offers
+`tq1_0` or `tq2_0` for that reason. The runtime still *reads* both, so a ternary
+GGUF from elsewhere loads fine; there is simply no way to make a broken one here.
+
+It is worth stating rather than quietly dropping: a sweep that reported only
+tok/s and file size would have made ternary look like the winner.
 
 ### Per-type decode throughput
 
@@ -228,14 +234,16 @@ What the float path pays per weight, single-threaded (`Melem/s` of output):
 | | | | | |
 |---|---|---|---|---|
 | F32 3882 | Q8_0 1520 | BF16 1475 | Q4_0 969 | Q4_K 713 |
-| IQ1_S 741 | TQ2_0 744 | Q5_0 743 | Q6_K 354 | F16 386 |
+| IQ1_S 741 | Q5_0 743 | IQ4_XS 575 | Q6_K 354 | F16 386 |
 | IQ2_XXS 192 | IQ2_S 172 | IQ3_XXS 158 | IQ3_S 126 | |
 
 The i-quants are 5–10× slower to decode than the legacy families, which is the
 cost of their codebook indirection. They are supported for completeness; if you
 want small *and* fast, Q4_0 with the integer path is the better trade.
 
-Full machine-readable results are in [`benchmark.json`](benchmark.json).
+Full machine-readable results are in [`benchmark.json`](benchmark.json), which
+records the run as it happened — including the TQ2_0 rows that prompted its
+removal.
 
 ## Requirements
 
