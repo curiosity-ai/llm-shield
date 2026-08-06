@@ -11,6 +11,7 @@ namespace LlmShield.Shieldstral.Tests;
 /// Vector&lt;float&gt;.Count elements correctly and drops a ragged tail produces
 /// activations that are almost right, which is the worst kind of wrong.
 /// </summary>
+[Collection(MatMulStrategyCollection.Name)]
 public class KernelTests
 {
     private static float[] Random(int n, int seed = 7)

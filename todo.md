@@ -53,6 +53,9 @@ Reading is complete. Writing is the converter's job and covers what the referenc
 
 ## 5. Conversion
 
+- [x] `tools/download_shieldstral.py`: fetches only the files the converter opens
+      (~7.2 GiB rather than the full repository's ~15 GB, which carries the same
+      weights in both Mistral and Hugging Face layouts), resumable and size-verified
 - [x] `tools/convert_shieldstral_to_gguf.py`: Mistral format → GGUF, no
       permutation of wq/wk (the checkpoint is already in ggml's RoPE layout)
 - [x] Tekken vocabulary → GGUF tokens/types + derived merge table

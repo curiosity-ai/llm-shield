@@ -15,6 +15,7 @@ namespace LlmShield.Shieldstral.Tests;
 /// unpacking of each weight family is right, which a systematic error would show
 /// as a bias rather than noise.
 /// </summary>
+[Collection(MatMulStrategyCollection.Name)]
 public class IntegerDotTests : IDisposable
 {
     private readonly ITestOutputHelper _output;

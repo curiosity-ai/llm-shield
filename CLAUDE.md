@@ -95,9 +95,12 @@ dotnet test                                          # no weights needed
 SHIELDSTRAL_MODEL=/path/to/model.gguf dotnet test    # + model-backed parity
 ```
 
-Tests that change `QuantMatMul.Strategy` must restore it — it is process-wide, so
-a leaked setting silently changes every later test in the run. `IntegerDotTests`
-does it in `Dispose`; `KernelTests` uses a `try`/`finally`.
+Tests that change `QuantMatMul.Strategy` must join
+`[Collection(MatMulStrategyCollection.Name)]` *and* restore it. The strategy is
+process-wide and xunit runs test classes in parallel, so restoring alone is not
+enough — one class pinning it to Float while another pins it to Integer makes both
+measure whatever the scheduler left behind, and it fails intermittently, which is
+worse than failing. The collection disables parallelism between them.
 
 `SHIELDSTRAL_MODEL` may be a `.gguf` or a directory to search. Model-backed tests
 write a line explaining the skip and pass when it is unset — keep that pattern
@@ -133,6 +136,10 @@ hand-written; regenerate rather than edit.
 
 ```bash
 pip install gguf numpy regex
+
+# the source weights, if you do not already have them (~7.2 GiB, not the 15 GB
+# the full repository would be — see the script's header for what it skips)
+python3 tools/download_shieldstral.py models/shieldstral
 
 # i-quant codebooks -> Quantization/QuantGrids.g.cs
 python3 tools/gen_quant_grids.py
