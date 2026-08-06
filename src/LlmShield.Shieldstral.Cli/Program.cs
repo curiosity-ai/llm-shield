@@ -67,8 +67,8 @@ internal static class Program
           inspect  <model.gguf>                          print metadata and tensor summary
           tokenize <model.gguf> <text>                   print token ids and pieces
           dump     <model.gguf> <prompt-file> <out.json> record activations for parity checks
-          bench    [<model.gguf|dir> ...] [--json out.json]
-                   [--no-micro] [--no-model] [--prefill-tokens N] [--decode-tokens N] [--repeats N]
+          bench    [<model.gguf|dir> ...] [--json out.json] [--no-micro] [--no-model]
+                   [--prefill-tokens N] [--decode-tokens N] [--warmups N] [--repeats N]
         """);
 
     // ------------------------------------------------------------- moderate

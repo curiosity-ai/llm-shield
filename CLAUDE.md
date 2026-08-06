@@ -134,6 +134,10 @@ hand-written; regenerate rather than edit.
 ```bash
 pip install gguf numpy regex
 
+# the source weights, if you do not already have them (~7.2 GiB, not the 15 GB
+# the full repository would be — see the script's header for what it skips)
+python3 tools/download_shieldstral.py models/shieldstral
+
 # i-quant codebooks -> Quantization/QuantGrids.g.cs
 python3 tools/gen_quant_grids.py
 

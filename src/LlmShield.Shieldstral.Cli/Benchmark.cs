@@ -17,8 +17,8 @@ namespace LlmShield.Shieldstral.Cli;
 /// Everything runs in one process on purpose. Comparing a float matmul measured
 /// now against an integer one measured in a separate invocation compares two
 /// machine states as much as two kernels — page cache, CPU frequency and, on a
-/// shared VM, the neighbours. One execution, interleaved warmups, medians over
-/// repeats.
+/// shared VM, the neighbours. One execution, warmup passes first, then the
+/// fastest of N samples: everything that makes a run slower here is noise.
 /// </summary>
 internal static class Benchmark
 {
@@ -36,7 +36,7 @@ internal static class Benchmark
         var models = new List<string>();
         bool micro = true, endToEnd = true;
         string? jsonPath = null;
-        int decodeTokens = 8, repeats = 2, prefillTokens = 256;
+        int decodeTokens = 8, repeats = 5, warmups = 3, prefillTokens = 256;
         var strategies = new List<MatMulStrategy>();
 
         for (int i = 0; i < args.Length; i++)
@@ -52,6 +52,7 @@ internal static class Benchmark
                 case "--decode-tokens": decodeTokens = ParseInt(Next(args, ref i)); break;
                 case "--prefill-tokens": prefillTokens = ParseInt(Next(args, ref i)); break;
                 case "--repeats": repeats = ParseInt(Next(args, ref i)); break;
+                case "--warmups": warmups = ParseInt(Next(args, ref i)); break;
                 case "--strategy":
                     strategies.Add(Enum.Parse<MatMulStrategy>(Next(args, ref i), ignoreCase: true));
                     break;
@@ -84,7 +85,8 @@ internal static class Benchmark
         {
             var sweeps = new Dictionary<string, object>();
             foreach (MatMulStrategy strategy in strategies)
-                sweeps[strategy.ToString()] = ModelSweep(models, prefillTokens, decodeTokens, repeats, strategy);
+                sweeps[strategy.ToString()] = ModelSweep(
+                    models, prefillTokens, decodeTokens, warmups, repeats, strategy);
             report["models"] = sweeps;
         }
         else if (endToEnd)
@@ -317,21 +319,24 @@ internal static class Benchmark
     // ------------------------------------------------------------- model sweep
 
     private static List<Dictionary<string, object>> ModelSweep(
-        List<string> models, int prefillTokens, int decodeTokens, int repeats, MatMulStrategy strategy)
+        List<string> models, int prefillTokens, int decodeTokens, int warmups, int repeats,
+        MatMulStrategy strategy)
     {
         QuantMatMul.Strategy = strategy;
         Console.WriteLine();
-        Console.WriteLine($"model sweep [{strategy} matmul] — prefill {prefillTokens} tokens, " +
-                          $"decode {decodeTokens} tokens, median of {repeats}");
+        Console.WriteLine($"model sweep [{strategy} matmul] — {prefillTokens}-token prompt with the " +
+                          $"system prompt pre-cached, {decodeTokens} decode tokens, " +
+                          $"{warmups} warmup passes then best of {repeats}");
         Console.WriteLine($"  {"model",-14} {"GiB",5} {"load s",7} {"prefill tok/s",14} {"decode tok/s",13} " +
-                          $"{"RSS GiB",8} {"alloc MiB",10} {"score",9}");
+                          $"{"request ms",11} {"RSS GiB",8} {"alloc MiB",10} {"score",9}");
 
         var rows = new List<Dictionary<string, object>>();
         foreach (string path in models)
         {
             try
             {
-                Dictionary<string, object> row = BenchmarkModel(path, prefillTokens, decodeTokens, repeats);
+                Dictionary<string, object> row = BenchmarkModel(
+                    path, prefillTokens, decodeTokens, warmups, repeats);
                 row["strategy"] = strategy.ToString();
                 rows.Add(row);
             }
@@ -344,8 +349,20 @@ internal static class Benchmark
         return rows;
     }
 
+    /// <summary>
+    /// Times one checkpoint with the system-prompt cache active throughout, which
+    /// is how the library actually runs.
+    ///
+    /// Two KV snapshots do the setup work. The system-prompt one is what production
+    /// uses; restoring it before each prefill sample is the state a real request
+    /// starts from. The whole-prompt one exists only for the decode measurement:
+    /// restoring it is a memcpy, so each decode sample starts from an identical
+    /// 256-token context without a 30-second prefill in front of it — and without
+    /// the context growing sample over sample, which would make every repeat slower
+    /// than the last for reasons that have nothing to do with the kernel.
+    /// </summary>
     private static Dictionary<string, object> BenchmarkModel(
-        string path, int prefillTokens, int decodeTokens, int repeats)
+        string path, int prefillTokens, int decodeTokens, int warmups, int repeats)
     {
         long fileBytes = new FileInfo(path).Length;
         long rssBefore = ResidentBytes();
@@ -356,48 +373,53 @@ internal static class Benchmark
         double loadSeconds = sw.Elapsed.TotalSeconds;
 
         int[] prompt = BuildPrompt(model, prefillTokens);
+        int[] systemPrefix = SystemPrefixTokens(model);
 
-        // One untimed pass pulls the weights into page cache and lets tiered JIT
-        // settle; without it the first model in a sweep is measured cold and every
-        // later one warm.
-        model.ResetKvCache();
-        model.Forward(prompt);
+        // Capturing these also pulls the weights into page cache and gives tiered
+        // JIT its first two passes, before anything is recorded.
+        var systemCache = SystemPromptCache.Capture(model, systemPrefix);
+        var promptCache = SystemPromptCache.Capture(model, prompt);
 
-        double prefillSeconds = TimeMedian(() =>
-        {
-            model.ResetKvCache();
-            model.Forward(prompt);
-        }, warmups: 0, repeats: repeats);
+        int cached = systemCache.TokenCount;
+        int forwarded = prompt.Length - cached;
+        int[] suffix = prompt[cached..];
 
-        // Decode: single-token forwards appended to an already-prefilled cache,
-        // which is the shape a generative workload runs at.
-        model.ResetKvCache();
-        model.Forward(prompt);
+        double prefillSeconds = TimeBest(
+            setup: () => systemCache.RestoreInto(model),
+            work: () => model.Forward(suffix),
+            warmups, repeats);
+
+        // Decode: single-token forwards onto a full 256-token context, which is the
+        // shape a generative workload runs at.
+        promptCache.RestoreInto(model);
         int next = Kernels.ArgMax(model.Forward(prompt[^1..]));
-        var single = new int[1];
-        double decodeSeconds = TimeMedian(() =>
-        {
-            for (int i = 0; i < decodeTokens; i++)
+        var single = new int[1] { next };
+        double decodeSeconds = TimeBest(
+            setup: () => promptCache.RestoreInto(model),
+            work: () =>
             {
-                single[0] = next;
-                model.Forward(single);
-            }
-        }, warmups: 0, repeats: 1);
+                for (int i = 0; i < decodeTokens; i++) model.Forward(single);
+            },
+            warmups, repeats);
 
-        double score;
-        using (var moderator = new ShieldstralModerator(model, ownsModel: false, cacheSystemPrompt: false))
-            score = moderator.Moderate(Instruct, Query, Document).Score;
+        // End-to-end latency of the thing the library is for, cache and all.
+        using var moderator = new ShieldstralModerator(model, ownsModel: false, cacheSystemPrompt: true);
+        double score = moderator.Moderate(Instruct, Query, Document).Score;
+        double requestSeconds = TimeBest(
+            setup: null,
+            work: () => moderator.Moderate(Instruct, Query, Document),
+            warmups, repeats);
 
         long rssAfter = ResidentBytes();
         long allocated = GC.GetTotalAllocatedBytes(precise: false) - allocBefore;
 
-        double prefillRate = prompt.Length / prefillSeconds;
+        double prefillRate = forwarded / prefillSeconds;
         double decodeRate = decodeTokens / decodeSeconds;
 
         Console.WriteLine(
             $"  {Label(path),-14} {fileBytes / (1024.0 * 1024 * 1024),5:F2} {loadSeconds,7:F2} " +
-            $"{prefillRate,14:F1} {decodeRate,13:F2} {rssAfter / (1024.0 * 1024 * 1024),8:F2} " +
-            $"{allocated / (1024.0 * 1024),10:F0} {score,9:F6}");
+            $"{prefillRate,14:F1} {decodeRate,13:F2} {requestSeconds * 1000,11:F0} " +
+            $"{rssAfter / (1024.0 * 1024 * 1024),8:F2} {allocated / (1024.0 * 1024),10:F0} {score,9:F6}");
 
         return new Dictionary<string, object>
         {
@@ -405,9 +427,15 @@ internal static class Benchmark
             ["path"] = path,
             ["file_bytes"] = fileBytes,
             ["load_seconds"] = loadSeconds,
-            ["prefill_tokens"] = prompt.Length,
+            ["prompt_tokens"] = prompt.Length,
+            ["cached_prefix_tokens"] = cached,
+            ["forwarded_tokens"] = forwarded,
+            ["prefill_seconds"] = prefillSeconds,
             ["prefill_tokens_per_second"] = prefillRate,
+            ["decode_tokens"] = decodeTokens,
+            ["decode_seconds"] = decodeSeconds,
             ["decode_tokens_per_second"] = decodeRate,
+            ["request_seconds"] = requestSeconds,
             ["rss_bytes_before"] = rssBefore,
             ["rss_bytes_after"] = rssAfter,
             ["managed_allocated_bytes"] = allocated,
@@ -416,6 +444,16 @@ internal static class Benchmark
             ["score_delta"] = Math.Abs(score - ReferenceScore),
         };
     }
+
+    /// <summary>
+    /// The invariant leading tokens every request shares: BOS plus the wrapped
+    /// system message, tokenized exactly as <see cref="ShieldstralModerator"/> does
+    /// so the snapshot is a true prefix of the benchmark prompt.
+    /// </summary>
+    private static int[] SystemPrefixTokens(MinistralModel model)
+        => [.. model.Tokenizer.Encode(
+            ChatTemplate.SystemOpen + ShieldstralModerator.SystemPrompt + ChatTemplate.SystemClose,
+            addSpecial: true)];
 
     /// <summary>A prompt of roughly <paramref name="targetTokens"/> tokens, padded with filler text.</summary>
     private static int[] BuildPrompt(MinistralModel model, int targetTokens)
@@ -505,18 +543,27 @@ internal static class Benchmark
         return best;
     }
 
-    private static double TimeMedian(Action work, int warmups, int repeats)
+    /// <summary>
+    /// Fastest of <paramref name="repeats"/> samples, with <paramref name="setup"/>
+    /// run untimed before each one.
+    ///
+    /// No inner repetition here, unlike the micro-benchmark overload: these
+    /// operations already take seconds, and the setup has to run once per sample to
+    /// put the model back in a comparable state.
+    /// </summary>
+    private static double TimeBest(Action? setup, Action work, int warmups, int repeats)
     {
-        for (int i = 0; i < warmups; i++) work();
-        var samples = new double[Math.Max(1, repeats)];
-        for (int i = 0; i < samples.Length; i++)
+        for (int i = 0; i < warmups; i++) { setup?.Invoke(); work(); }
+
+        double best = double.MaxValue;
+        for (int i = 0; i < Math.Max(1, repeats); i++)
         {
+            setup?.Invoke();
             var sw = Stopwatch.StartNew();
             work();
-            samples[i] = sw.Elapsed.TotalSeconds;
+            best = Math.Min(best, sw.Elapsed.TotalSeconds);
         }
-        Array.Sort(samples);
-        return samples[samples.Length / 2];
+        return best;
     }
 
     /// <summary>

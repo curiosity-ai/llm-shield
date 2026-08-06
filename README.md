@@ -50,11 +50,21 @@ The runtime reads GGUF. Convert Mistral's official release once:
 ```bash
 pip install gguf numpy
 
-# ~7.7 GB; consolidated.safetensors + params.json + tekken.json + chat_template.jinja
-huggingface-cli download mistralai/Shieldstral-1.0-3B --local-dir models/shieldstral
+# ~7.2 GiB — only the files the converter opens
+python3 tools/download_shieldstral.py models/shieldstral
 
 python3 tools/convert_shieldstral_to_gguf.py models/shieldstral --outtype q8_0 --vision
 ```
+
+The download script exists because `huggingface-cli download` fetches the whole
+repository, and half of that is the same weights twice: `consolidated.safetensors`
+(Mistral format, 7.70 GB) and `model.safetensors` (Hugging Face format, 7.70 GB)
+are the same parameters in two layouts, and `tokenizer.json` re-encodes what
+`tekken.json` already holds. The converter reads the Mistral side, so the rest is
+15 GB of downloading to reach a 7.2 GiB working set. The script needs nothing but
+the standard library, resumes, checks free space before it starts, and verifies
+every file's size against the server before moving it into place —
+`--check` re-verifies an existing directory without downloading.
 
 That writes `Shieldstral-1.0-3B-Q8_0.gguf` (3.4 GiB) and, with `--vision`, the
 Pixtral tower as a separate `mmproj` file. `--outtype` accepts `f32`, `f16`,
