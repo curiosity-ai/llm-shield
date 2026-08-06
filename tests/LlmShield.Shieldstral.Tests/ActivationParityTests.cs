@@ -70,9 +70,10 @@ public class ActivationParityTests
         // direction of the whole vector is what a wiring error changes, and it moves
         // that by orders of magnitude more than this.
         //
-        // Measured on the Q8_0 build: every tensor lands at or below 3.4e-2, and the
-        // error does not grow with depth (the last layer is the tightest at 3.0e-3).
-        double tolerance = Fixtures.IsQ8Reference(modelPath) ? 0.05 : 0.15;
+        // The bound is per quantization — see Fixtures.ParityTolerance. A single number is
+        // either meaningless on Q8_0 or red on every other published checkpoint, since the
+        // measured spread between them is an order of magnitude.
+        double tolerance = Fixtures.ParityTolerance(modelPath);
 
         var failures = new List<string>();
         int compared = 0;
