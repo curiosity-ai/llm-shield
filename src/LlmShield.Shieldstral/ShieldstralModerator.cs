@@ -93,18 +93,29 @@ public sealed class ShieldstralModerator : IDisposable
         _model = model;
         _ownsModel = ownsModel;
 
-        _yesTokens = ResolveVerdictTokens(YesForms);
-        _noTokens = ResolveVerdictTokens(NoForms);
-        if (_yesTokens.Length == 0 || _noTokens.Length == 0)
-            throw new InvalidDataException(
-                "The model's vocabulary has no 'yes'/'no' tokens; this does not look like a Shieldstral checkpoint.");
-
-        if (cacheSystemPrompt)
+        // Rejecting a checkpoint here must also let go of it: the file stays memory-mapped
+        // otherwise, and Windows will not delete a mapped file — which is what CreateAsync
+        // does before fetching a corrupt model again.
+        try
         {
-            int[] prefix = BuildSystemPrefixTokens();
-            _prefix = prefixCachePath is null
-                ? SystemPromptCache.Capture(_model, prefix)
-                : SystemPromptCache.LoadOrCapture(_model, prefix, prefixCachePath);
+            _yesTokens = ResolveVerdictTokens(YesForms);
+            _noTokens = ResolveVerdictTokens(NoForms);
+            if (_yesTokens.Length == 0 || _noTokens.Length == 0)
+                throw new InvalidDataException(
+                    "The model's vocabulary has no 'yes'/'no' tokens; this does not look like a Shieldstral checkpoint.");
+
+            if (cacheSystemPrompt)
+            {
+                int[] prefix = BuildSystemPrefixTokens();
+                _prefix = prefixCachePath is null
+                    ? SystemPromptCache.Capture(_model, prefix)
+                    : SystemPromptCache.LoadOrCapture(_model, prefix, prefixCachePath);
+            }
+        }
+        catch
+        {
+            if (ownsModel) model.Dispose();
+            throw;
         }
     }
 

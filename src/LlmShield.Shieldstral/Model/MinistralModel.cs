@@ -61,39 +61,52 @@ public sealed unsafe class MinistralModel : IDisposable
     {
         _gguf = gguf;
         _ownsFile = ownsFile;
-        Config = ModelConfig.FromGguf(gguf);
-        Tokenizer = TekkenTokenizer.FromGguf(gguf);
-        _rope = new Rope(Config);
 
-        _tokenEmbeddings = WeightMatrix.From(gguf, "token_embd.weight");
-        _outputNorm = VectorParameter.From(gguf, "output_norm.weight");
-        // Shieldstral ties the LM head to the embedding table, so `output.weight`
-        // is legitimately absent; fall back to the embeddings in that case.
-        _lmHead = WeightMatrix.From(gguf, "output.weight", required: false);
-
-        _layers = new Layer[Config.LayerCount];
-        for (int l = 0; l < Config.LayerCount; l++)
+        // A GGUF that is missing a tensor or disagrees with its own hyperparameters throws from
+        // here, and then nobody holds the mapping this constructor opened. Windows still will not
+        // let a mapped file be deleted, and deleting it is what the callers that catch these do —
+        // ShieldstralModerator.CreateAsync drops a corrupt cached model and downloads it again.
+        try
         {
-            string p = $"blk.{l}.";
-            _layers[l] = new Layer
+            Config = ModelConfig.FromGguf(gguf);
+            Tokenizer = TekkenTokenizer.FromGguf(gguf);
+            _rope = new Rope(Config);
+
+            _tokenEmbeddings = WeightMatrix.From(gguf, "token_embd.weight");
+            _outputNorm = VectorParameter.From(gguf, "output_norm.weight");
+            // Shieldstral ties the LM head to the embedding table, so `output.weight`
+            // is legitimately absent; fall back to the embeddings in that case.
+            _lmHead = WeightMatrix.From(gguf, "output.weight", required: false);
+
+            _layers = new Layer[Config.LayerCount];
+            for (int l = 0; l < Config.LayerCount; l++)
             {
-                AttentionNorm = VectorParameter.From(gguf, p + "attn_norm.weight"),
-                Q = WeightMatrix.From(gguf, p + "attn_q.weight"),
-                K = WeightMatrix.From(gguf, p + "attn_k.weight"),
-                V = WeightMatrix.From(gguf, p + "attn_v.weight"),
-                O = WeightMatrix.From(gguf, p + "attn_output.weight"),
-                FfnNorm = VectorParameter.From(gguf, p + "ffn_norm.weight"),
-                Gate = WeightMatrix.From(gguf, p + "ffn_gate.weight"),
-                Up = WeightMatrix.From(gguf, p + "ffn_up.weight"),
-                Down = WeightMatrix.From(gguf, p + "ffn_down.weight"),
-            };
+                string p = $"blk.{l}.";
+                _layers[l] = new Layer
+                {
+                    AttentionNorm = VectorParameter.From(gguf, p + "attn_norm.weight"),
+                    Q = WeightMatrix.From(gguf, p + "attn_q.weight"),
+                    K = WeightMatrix.From(gguf, p + "attn_k.weight"),
+                    V = WeightMatrix.From(gguf, p + "attn_v.weight"),
+                    O = WeightMatrix.From(gguf, p + "attn_output.weight"),
+                    FfnNorm = VectorParameter.From(gguf, p + "ffn_norm.weight"),
+                    Gate = WeightMatrix.From(gguf, p + "ffn_gate.weight"),
+                    Up = WeightMatrix.From(gguf, p + "ffn_up.weight"),
+                    Down = WeightMatrix.From(gguf, p + "ffn_down.weight"),
+                };
+            }
+
+            ValidateShapes();
+
+            KvCache = new KvCache(Config.LayerCount, Config.KvHeadCount, Config.HeadDim, initialCacheCapacity);
+            _logits = new float[Config.VocabSize];
+            _scoreScratch = new float[Config.HeadCount][];
         }
-
-        ValidateShapes();
-
-        KvCache = new KvCache(Config.LayerCount, Config.KvHeadCount, Config.HeadDim, initialCacheCapacity);
-        _logits = new float[Config.VocabSize];
-        _scoreScratch = new float[Config.HeadCount][];
+        catch
+        {
+            if (ownsFile) gguf.Dispose();
+            throw;
+        }
     }
 
     private void ValidateShapes()

@@ -64,11 +64,11 @@ public sealed unsafe class GgufFile : IDisposable
     private readonly long _length;
 
     public string Path { get; }
-    public uint Version { get; }
+    public uint Version { get; private set; }
     public IReadOnlyDictionary<string, object> Metadata => _metadata;
     public IReadOnlyDictionary<string, GgufTensorInfo> Tensors => _tensors;
     /// <summary>File offset at which the tensor-data section starts.</summary>
-    public long DataOffset { get; }
+    public long DataOffset { get; private set; }
 
     private readonly Dictionary<string, object> _metadata = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GgufTensorInfo> _tensors = new(StringComparer.Ordinal);
@@ -91,10 +91,28 @@ public sealed unsafe class GgufFile : IDisposable
         _pointerAcquired = true;
         _base = p + _view.PointerOffset;
 
+        // From here on the file is mapped, so a rejected header has to release it before it
+        // leaves. Nobody else can: the constructor threw, so there is no instance to dispose.
+        // Windows will not let a mapped file be deleted, and deleting it is exactly what the
+        // callers that catch this do — ShieldstralModerator.CreateAsync drops a corrupt cached
+        // model and downloads it again.
+        try
+        {
+            Parse();
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    private void Parse()
+    {
         long cursor = 0;
         uint magic = ReadU32(ref cursor);
         if (magic != Magic)
-            throw new InvalidDataException($"{path} is not a GGUF file (magic 0x{magic:X8}).");
+            throw new InvalidDataException($"{Path} is not a GGUF file (magic 0x{magic:X8}).");
         Version = ReadU32(ref cursor);
         if (Version is < 2 or > 3)
             throw new NotSupportedException($"GGUF version {Version} is not supported (expected 2 or 3).");
