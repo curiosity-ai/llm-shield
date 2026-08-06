@@ -53,7 +53,7 @@ public class IntegerDotTests : IDisposable
 
     [Theory]
     [MemberData(nameof(IntegerTypes))]
-    public unsafe void IntegerPathAgreesWithFloatPath(GgmlType type)
+    public async Task IntegerPathAgreesWithFloatPath(GgmlType type)
     {
         const int rows = 96, cols = 3072, tokens = 3;
         byte[] weights = QuantizeRows(type, rows, cols, seed: 21);
@@ -65,16 +65,11 @@ public class IntegerDotTests : IDisposable
         var viaFloat = new float[tokens * rows];
         var viaInteger = new float[tokens * rows];
 
-        fixed (byte* w = weights)
-        {
-            var matrix = new WeightMatrix(type, w, rows, cols);
+        QuantMatMul.Strategy = MatMulStrategy.Float;
+        await PinnedMatMul.ForwardAsync(type, weights, rows, cols, x, tokens, viaFloat);
 
-            QuantMatMul.Strategy = MatMulStrategy.Float;
-            QuantMatMul.Forward(matrix, x, tokens, viaFloat);
-
-            QuantMatMul.Strategy = MatMulStrategy.Integer;
-            QuantMatMul.Forward(matrix, x, tokens, viaInteger);
-        }
+        QuantMatMul.Strategy = MatMulStrategy.Integer;
+        await PinnedMatMul.ForwardAsync(type, weights, rows, cols, x, tokens, viaInteger);
 
         double norm = 0, difference = 0, bias = 0;
         for (int i = 0; i < viaFloat.Length; i++)

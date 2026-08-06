@@ -173,9 +173,35 @@ entirely in that independence.
 the first few layers. Full rows for 26 layers would be tens of megabytes, and the
 last row is the one every downstream value depends on.
 
+## Parallelism
+
+Every loop that spreads across cores — the row chunks in `QuantMatMul` and the
+attention heads in `MinistralModel` — takes its fan-out from a `ParallelOptions`
+threaded down from the caller, so a host bounds the whole runtime with one
+setting. That is why the forward path is asynchronous: `Parallel.ForAsync` is
+what carries the options, and `await` cannot appear in an `unsafe` context, which
+is in turn why `QuantMatMul` is no longer an `unsafe` class — only the individual
+pointer-using helpers are, and they are called from inside the loop body rather
+than wrapping it.
+
+Two consequences worth remembering before "simplifying" any of it back:
+
+- **A `fixed` region cannot span an `await`.** The parallel regions therefore pass
+  `Memory<T>` (which a lambda *can* capture) and take their spans inside the body,
+  or pin with a `GCHandle` where a raw pointer is genuinely needed — see
+  `PinnedMatMul` in the tests and `Benchmark.MatMulWork`.
+- **Scratch buffers come from `ArrayPool`, not from a per-head field.** The
+  attention scores buffer used to be a `float[][]` on the model, one slot per head.
+  That only works while the fan-out is fixed at construction; renting per iteration
+  costs nothing measurable and stops the model pinning a buffer per head forever.
+
+The result must not depend on the fan-out — row chunks write to disjoint slices,
+so no accumulation can be reordered.
+→ `KernelTests.MaxDegreeOfParallelismDoesNotChangeTheResult`
+
 ## Performance notes
 
-The hot loop is `QuantMatMul.Forward`. Its shape is deliberate: weights dominate
+The hot loop is `QuantMatMul.ForwardAsync`. Its shape is deliberate: weights dominate
 both the memory traffic and the decode cost, so each weight row is touched once
 per call and, in the float path, decoded into an L1-resident scratch buffer while
 every token in the current tile dots against it. Tiling the tokens
@@ -230,9 +256,10 @@ never leave the agent.
 ## Conventions
 
 - `unsafe` and pointers are fine in `Gguf`, `Quantization` and `Numerics`; the
-  model layer should stay in spans where it can.
+  model layer should stay in spans where it can. Put `unsafe` on the member, not
+  the class, so the file can still contain an `await`.
 - Buffers come from `ArrayPool<float>.Shared`. Return them in `finally`.
-- A `Span<T>` cannot be captured by a lambda — the parallel regions in
-  `MinistralModel` use `fixed` pointers for exactly that reason.
+- A `Span<T>` cannot be captured by a lambda, and cannot live across an `await` —
+  the parallel regions hold `Memory<T>` and take `.Span` inside the body.
 - Public API is documented with `///`; explain *why*, not what the code says.
 - Errors name the file and what to do: "re-download this file", not "bad header".

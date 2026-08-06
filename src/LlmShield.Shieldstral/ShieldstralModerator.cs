@@ -61,37 +61,30 @@ public sealed class ShieldstralModerator : IDisposable
 
     private readonly MinistralModel _model;
     private readonly bool _ownsModel;
-    private readonly SystemPromptCache? _prefix;
+    private readonly ParallelOptions _options;
     private readonly int[] _yesTokens;
     private readonly int[] _noTokens;
+    private SystemPromptCache? _prefix;
 
     public MinistralModel Model => _model;
     public ModelConfig Config => _model.Config;
 
+    /// <summary>
+    /// The fan-out every request uses unless it passes its own. Scoring is the only
+    /// thing this library spends CPU on, so capping
+    /// <see cref="ParallelOptions.MaxDegreeOfParallelism"/> here caps the whole
+    /// runtime — a host sharing the machine with anything else wants that bounded.
+    /// </summary>
+    public ParallelOptions ParallelOptions => _options;
+
     /// <summary>Tokens of the cached system-prompt prefix, or 0 when caching is off.</summary>
     public int CachedPrefixTokens => _prefix?.TokenCount ?? 0;
 
-    /// <summary>
-    /// Opens a Shieldstral GGUF.
-    /// </summary>
-    /// <param name="ggufPath">Path to the converted language model.</param>
-    /// <param name="cacheSystemPrompt">
-    /// Prefill and reuse the fixed system prompt's KV state. On by default; the
-    /// results are identical either way, which <c>SystemPromptCacheTests</c> asserts.
-    /// </param>
-    /// <param name="prefixCachePath">
-    /// Optional file to persist the prefix state in, so even the first request of a
-    /// fresh process skips the system-prompt prefill.
-    /// </param>
-    public ShieldstralModerator(string ggufPath, bool cacheSystemPrompt = true, string? prefixCachePath = null)
-        : this(new MinistralModel(ggufPath), ownsModel: true, cacheSystemPrompt, prefixCachePath) { }
-
-    public ShieldstralModerator(
-        MinistralModel model, bool ownsModel = false,
-        bool cacheSystemPrompt = true, string? prefixCachePath = null)
+    private ShieldstralModerator(MinistralModel model, bool ownsModel, ParallelOptions options)
     {
         _model = model;
         _ownsModel = ownsModel;
+        _options = options;
 
         // Rejecting a checkpoint here must also let go of it: the file stays memory-mapped
         // otherwise, and Windows will not delete a mapped file — which is what CreateAsync
@@ -103,20 +96,67 @@ public sealed class ShieldstralModerator : IDisposable
             if (_yesTokens.Length == 0 || _noTokens.Length == 0)
                 throw new InvalidDataException(
                     "The model's vocabulary has no 'yes'/'no' tokens; this does not look like a Shieldstral checkpoint.");
-
-            if (cacheSystemPrompt)
-            {
-                int[] prefix = BuildSystemPrefixTokens();
-                _prefix = prefixCachePath is null
-                    ? SystemPromptCache.Capture(_model, prefix)
-                    : SystemPromptCache.LoadOrCapture(_model, prefix, prefixCachePath);
-            }
         }
         catch
         {
             if (ownsModel) model.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Opens a Shieldstral GGUF that is already on disk.
+    /// <para>
+    /// Asynchronous because warming the system-prompt prefix runs a real prefill,
+    /// which is a full pass over the weights and therefore goes through the same
+    /// bounded parallel path every later request uses.
+    /// </para>
+    /// </summary>
+    /// <param name="ggufPath">Path to the converted language model.</param>
+    /// <param name="cacheSystemPrompt">
+    /// Prefill and reuse the fixed system prompt's KV state. On by default; the
+    /// results are identical either way, which <c>SystemPromptCacheTests</c> asserts.
+    /// </param>
+    /// <param name="prefixCachePath">
+    /// Optional file to persist the prefix state in, so even the first request of a
+    /// fresh process skips the system-prompt prefill.
+    /// </param>
+    /// <param name="options">
+    /// Default fan-out for this instance's scoring. Omit for one worker per core.
+    /// </param>
+    public static ValueTask<ShieldstralModerator> OpenAsync(
+        string ggufPath,
+        bool cacheSystemPrompt = true,
+        string? prefixCachePath = null,
+        ParallelOptions? options = null)
+        => OpenAsync(new MinistralModel(ggufPath), ownsModel: true, cacheSystemPrompt, prefixCachePath, options);
+
+    public static async ValueTask<ShieldstralModerator> OpenAsync(
+        MinistralModel model,
+        bool ownsModel = false,
+        bool cacheSystemPrompt = true,
+        string? prefixCachePath = null,
+        ParallelOptions? options = null)
+    {
+        var moderator = new ShieldstralModerator(model, ownsModel, options ?? new ParallelOptions());
+
+        try
+        {
+            if (cacheSystemPrompt)
+            {
+                ReadOnlyMemory<int> prefix = moderator.BuildSystemPrefixTokens();
+                moderator._prefix = prefixCachePath is null
+                    ? await SystemPromptCache.CaptureAsync(model, prefix, moderator._options).ConfigureAwait(false)
+                    : await SystemPromptCache.LoadOrCaptureAsync(model, prefix, prefixCachePath, moderator._options).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            moderator.Dispose();
+            throw;
+        }
+
+        return moderator;
     }
 
     /// <summary>
@@ -130,8 +170,9 @@ public sealed class ShieldstralModerator : IDisposable
     /// <param name="quantization">Which published model to use. Defaults to <see cref="ShieldstralQuantization.Q5_1"/>.</param>
     /// <param name="modelUrl">Overrides the download URL — for a mirror, or a model you converted yourself.</param>
     /// <param name="downloadToPath">Where to cache the file. Defaults to <see cref="ModelDownloader.DefaultPathFor"/>.</param>
-    /// <param name="cacheSystemPrompt">See the constructor.</param>
-    /// <param name="prefixCachePath">See the constructor.</param>
+    /// <param name="cacheSystemPrompt">See <see cref="OpenAsync(string, bool, string, ParallelOptions)"/>.</param>
+    /// <param name="prefixCachePath">See <see cref="OpenAsync(string, bool, string, ParallelOptions)"/>.</param>
+    /// <param name="options">Default fan-out for this instance's scoring. Omit for one worker per core.</param>
     /// <param name="reportProgress">Optional download progress callback (~2 Hz).</param>
     /// <param name="cancellationToken">Cancels the download; a partial file is kept and resumes next time.</param>
     public static async Task<ShieldstralModerator> CreateAsync(
@@ -140,6 +181,7 @@ public sealed class ShieldstralModerator : IDisposable
         string? downloadToPath = null,
         bool cacheSystemPrompt = true,
         string? prefixCachePath = null,
+        ParallelOptions? options = null,
         Action<DownloadProgress>? reportProgress = null,
         CancellationToken cancellationToken = default)
     {
@@ -149,7 +191,7 @@ public sealed class ShieldstralModerator : IDisposable
         await ModelDownloader.DownloadFileAsync(url, path, reportProgress, cancellationToken).ConfigureAwait(false);
         try
         {
-            return await OpenAsync().ConfigureAwait(false);
+            return await OpenCachedAsync().ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is InvalidDataException or IOException or NotSupportedException or KeyNotFoundException)
         {
@@ -159,36 +201,45 @@ public sealed class ShieldstralModerator : IDisposable
             // conclude that the model itself is the problem.
             try { File.Delete(path); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
             await ModelDownloader.DownloadFileAsync(url, path, reportProgress, cancellationToken).ConfigureAwait(false);
-            return await OpenAsync().ConfigureAwait(false);
+            return await OpenCachedAsync().ConfigureAwait(false);
         }
 
-        // Opening is not I/O-bound — the weights are memory-mapped in milliseconds, but capturing
-        // the system-prompt prefix runs a real prefill. Off the caller's thread it goes.
-        Task<ShieldstralModerator> OpenAsync() => Task.Run(
-            () => new ShieldstralModerator(path, cacheSystemPrompt, prefixCachePath), cancellationToken);
+        // Mapping the weights is a syscall, but capturing the system-prompt prefix runs a real
+        // prefill — that part is bounded by `options` rather than by the caller's thread.
+        async Task<ShieldstralModerator> OpenCachedAsync()
+            => await OpenAsync(path, cacheSystemPrompt, prefixCachePath, options).ConfigureAwait(false);
     }
 
-    /// <summary>Scores one request.</summary>
-    public ModerationResult Moderate(string instruct, string query, string document)
-        => Moderate(new ModerationRequest(instruct, query, document));
+    /// <summary>
+    /// Scores one request.
+    /// <para>
+    /// <paramref name="options"/> overrides <see cref="ParallelOptions"/> for this
+    /// call alone — useful when one caller wants a wider or narrower fan-out than
+    /// the instance's default without opening a second model.
+    /// </para>
+    /// </summary>
+    public ValueTask<ModerationResult> ModerateAsync(
+        string instruct, string query, string document, ParallelOptions? options = null)
+        => ModerateAsync(new ModerationRequest(instruct, query, document), options);
 
-    public ModerationResult Moderate(ModerationRequest request)
+    public async ValueTask<ModerationResult> ModerateAsync(ModerationRequest request, ParallelOptions? options = null)
     {
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
-        ReadOnlySpan<float> logits = _model.Forward(tokens.AsSpan(prefilled));
-        return Score(logits, tokens.Length, prefilled);
+        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), options ?? _options).ConfigureAwait(false);
+        return Score(logits.Span, tokens.Length, prefilled);
     }
 
     /// <summary>
     /// Full logits for the verdict position. Exposed for callers that want the
     /// whole distribution (calibration work, or a different scoring rule).
     /// </summary>
-    public float[] VerdictLogits(ModerationRequest request)
+    public async ValueTask<float[]> VerdictLogitsAsync(ModerationRequest request, ParallelOptions? options = null)
     {
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
-        return _model.Forward(tokens.AsSpan(prefilled)).ToArray();
+        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), options ?? _options).ConfigureAwait(false);
+        return logits.ToArray();
     }
 
     /// <summary>The exact prompt string sent to the tokenizer, for auditing.</summary>
@@ -281,12 +332,12 @@ public sealed class ShieldstralModerator : IDisposable
     /// The single most likely verdict token, decoded. Useful as a sanity check:
     /// anything other than "yes"/"no" means the prompt framing has drifted.
     /// </summary>
-    public string TopVerdictToken(ModerationRequest request)
+    public async ValueTask<string> TopVerdictTokenAsync(ModerationRequest request, ParallelOptions? options = null)
     {
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
-        ReadOnlySpan<float> logits = _model.Forward(tokens.AsSpan(prefilled));
-        return _model.Tokenizer.Decode(Kernels.ArgMax(logits));
+        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), options ?? _options).ConfigureAwait(false);
+        return _model.Tokenizer.Decode(Kernels.ArgMax(logits.Span));
     }
 
     public void Dispose()

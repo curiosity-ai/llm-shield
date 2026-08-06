@@ -48,14 +48,15 @@ public sealed class SystemPromptCache
     /// Prefills <paramref name="tokens"/> into a freshly reset cache and captures
     /// the result. The model's KV cache is left holding exactly that prefix.
     /// </summary>
-    public static SystemPromptCache Capture(MinistralModel model, ReadOnlySpan<int> tokens)
+    public static async ValueTask<SystemPromptCache> CaptureAsync(
+        MinistralModel model, ReadOnlyMemory<int> tokens, ParallelOptions options)
     {
         model.ResetKvCache();
-        model.Prefill(tokens);
+        await model.PrefillAsync(tokens, options).ConfigureAwait(false);
         return new SystemPromptCache(
             tokens.ToArray(),
             model.KvCache.Snapshot(tokens.Length),
-            ComputeFingerprint(model, tokens));
+            ComputeFingerprint(model, tokens.Span));
     }
 
     /// <summary>
@@ -167,13 +168,14 @@ public sealed class SystemPromptCache
     /// <paramref name="path"/> when it is still valid and otherwise recomputing
     /// and writing it back.
     /// </summary>
-    public static SystemPromptCache LoadOrCapture(MinistralModel model, ReadOnlySpan<int> tokens, string path)
+    public static async ValueTask<SystemPromptCache> LoadOrCaptureAsync(
+        MinistralModel model, ReadOnlyMemory<int> tokens, string path, ParallelOptions options)
     {
         SystemPromptCache? cached = TryLoad(path, model);
-        if (cached is not null && cached.Tokens.AsSpan().SequenceEqual(tokens))
+        if (cached is not null && cached.Tokens.AsSpan().SequenceEqual(tokens.Span))
             return cached;
 
-        SystemPromptCache fresh = Capture(model, tokens);
+        SystemPromptCache fresh = await CaptureAsync(model, tokens, options).ConfigureAwait(false);
         try { fresh.Save(path); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {

@@ -18,7 +18,7 @@ dotnet add package LlmShield.Shieldstral
 // Downloads the model on first use (~1.8-2.4 GiB) and caches it; opens it directly after that.
 using var moderator = await ShieldstralModerator.CreateAsync(ShieldstralQuantization.Q4_0);
 
-ModerationResult result = moderator.Moderate(
+ModerationResult result = await moderator.ModerateAsync(
     instruct: "You are a strict safety moderator reviewing potentially harmful content. " +
               "Apply a low tolerance threshold.",
     query:    "Does this content promote physical violence?",
@@ -32,6 +32,29 @@ Console.WriteLine(result.IsUnsafe);   // True
 "no" logits against each other, with the rest of the vocabulary renormalised
 away, exactly as the model card's reference scorer does. The 0.5 threshold is a
 default, not a law — `IsUnsafeAt(threshold)` lets you move it.
+
+## Bounding the CPU it uses
+
+Scoring is the only thing this library spends CPU on, and it spreads two loops
+across cores: the rows of every matmul, and the attention heads. Both take their
+fan-out from a `ParallelOptions` you supply, so one setting bounds the whole
+runtime — which matters when the process is a server that has other work to do.
+
+```csharp
+// Never more than half the machine, however many requests are in flight.
+var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2) };
+
+using var moderator = await ShieldstralModerator.CreateAsync(
+    ShieldstralQuantization.Q4_0, options: options);
+
+// ...or per call, when one caller wants a different share than the instance default.
+ModerationResult result = await moderator.ModerateAsync(request, options);
+```
+
+The result does not depend on the fan-out: row chunks write to disjoint slices, so
+the number of workers cannot reorder an accumulation. `options.CancellationToken`
+reaches the row loop too, so a cancelled request stops inside the matmul rather
+than at the next one.
 
 ## What is here
 
@@ -73,6 +96,8 @@ using var moderator = await ShieldstralModerator.CreateAsync(
     downloadToPath: "/var/lib/myapp/shieldstral.gguf",   // defaults to a temp folder
     reportProgress: p => Console.Write($"\r{p.Fraction:P0}"));
 ```
+
+A model already on disk opens with `ShieldstralModerator.OpenAsync(path)`.
 
 The transfer resumes, including across process restarts: bytes land in a
 `.download` sidecar and are renamed into place only once the file is complete, so
@@ -136,7 +161,7 @@ dotnet run --project src/LlmShield.Shieldstral.Cli -c Release -- \
 ```
 
 `--json` emits a machine-readable result; `--document-file` or stdin takes the
-content from a file. `download` fetches a converted model, `inspect` prints a
+content from a file; `--threads N` caps the worker count (`bench` takes it too). `download` fetches a converted model, `inspect` prints a
 GGUF's metadata and tensor breakdown,
 `tokenize` shows token ids and pieces, `dump` records per-layer activations for
 the parity harness, and `bench` runs the benchmark suite.
@@ -174,7 +199,7 @@ instruct/query/document suffix to run.
 It is on by default and can be persisted so even a fresh process skips it:
 
 ```csharp
-using var moderator = new ShieldstralModerator(
+using var moderator = await ShieldstralModerator.OpenAsync(
     "Shieldstral-1.0-3B-Q8_0.gguf",
     prefixCachePath: "shieldstral-prefix.bin");   // ~7 MiB
 ```

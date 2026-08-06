@@ -39,20 +39,20 @@ public class SystemPromptCacheTests
     }
 
     [Fact]
-    public void CachedAndUncachedProduceIdenticalLogits()
+    public async Task CachedAndUncachedProduceIdenticalLogits()
     {
         if (Model() is not { } modelPath) return;
 
-        using var cached = new ShieldstralModerator(modelPath, cacheSystemPrompt: true);
-        using var uncached = new ShieldstralModerator(modelPath, cacheSystemPrompt: false);
+        using var cached = await ShieldstralModerator.OpenAsync(modelPath, cacheSystemPrompt: true);
+        using var uncached = await ShieldstralModerator.OpenAsync(modelPath, cacheSystemPrompt: false);
 
         Assert.True(cached.CachedPrefixTokens > 0, "no system-prompt prefix was cached");
         Assert.Equal(0, uncached.CachedPrefixTokens);
 
         foreach (ModerationRequest request in Requests)
         {
-            float[] withCache = cached.VerdictLogits(request);
-            float[] withoutCache = uncached.VerdictLogits(request);
+            float[] withCache = await cached.VerdictLogitsAsync(request);
+            float[] withoutCache = await uncached.VerdictLogitsAsync(request);
 
             // Restoring a snapshot copies the very floats the prefill wrote, and the
             // suffix then runs against identical state — so this is bit-for-bit, not
@@ -68,18 +68,18 @@ public class SystemPromptCacheTests
     }
 
     [Fact]
-    public void TheCachedPrefixIsATruePrefixOfEveryPrompt()
+    public async Task TheCachedPrefixIsATruePrefixOfEveryPrompt()
     {
         if (Model() is not { } modelPath) return;
 
-        using var moderator = new ShieldstralModerator(modelPath);
+        using var moderator = await ShieldstralModerator.OpenAsync(modelPath);
         int prefixLength = moderator.CachedPrefixTokens;
 
         foreach (ModerationRequest request in Requests)
         {
             int[] tokens = moderator.Tokenize(request);
             Assert.True(tokens.Length > prefixLength);
-            ModerationResult result = moderator.Moderate(request);
+            ModerationResult result = await moderator.ModerateAsync(request);
             Assert.Equal(prefixLength, result.PrefilledTokens);
             Assert.Equal(tokens.Length, result.PromptTokens);
         }
@@ -87,23 +87,23 @@ public class SystemPromptCacheTests
     }
 
     [Fact]
-    public void RepeatedCallsAreStable()
+    public async Task RepeatedCallsAreStable()
     {
         if (Model() is not { } modelPath) return;
 
         // Restoring must fully overwrite the previous request's KV state; a stale
         // tail would make the second call disagree with the first.
-        using var moderator = new ShieldstralModerator(modelPath);
-        ModerationResult first = moderator.Moderate(Requests[0]);
-        moderator.Moderate(Requests[1]);
-        ModerationResult again = moderator.Moderate(Requests[0]);
+        using var moderator = await ShieldstralModerator.OpenAsync(modelPath);
+        ModerationResult first = await moderator.ModerateAsync(Requests[0]);
+        await moderator.ModerateAsync(Requests[1]);
+        ModerationResult again = await moderator.ModerateAsync(Requests[0]);
 
         Assert.Equal(first.Score, again.Score);
         Assert.Equal(first.YesLogit, again.YesLogit);
     }
 
     [Fact]
-    public void SnapshotSurvivesASaveAndLoadRoundTrip()
+    public async Task SnapshotSurvivesASaveAndLoadRoundTrip()
     {
         if (Model() is not { } modelPath) return;
 
@@ -115,7 +115,7 @@ public class SystemPromptCacheTests
                 ChatTemplate.SystemOpen + ShieldstralModerator.SystemPrompt + ChatTemplate.SystemClose,
                 addSpecial: true)];
 
-            SystemPromptCache captured = SystemPromptCache.Capture(model, tokens);
+            SystemPromptCache captured = await SystemPromptCache.CaptureAsync(model, tokens, new ParallelOptions());
             captured.Save(path);
             _output.WriteLine($"{captured.TokenCount} tokens, {captured.ByteSize / (1024.0 * 1024):F1} MiB");
 
@@ -136,13 +136,13 @@ public class SystemPromptCacheTests
     }
 
     [Fact]
-    public void ASnapshotForADifferentPrefixIsRefused()
+    public async Task ASnapshotForADifferentPrefixIsRefused()
     {
         if (Model() is not { } modelPath) return;
 
         using var model = new MinistralModel(modelPath);
         int[] tokens = [.. model.Tokenizer.Encode("[SYSTEM_PROMPT]a[/SYSTEM_PROMPT]", addSpecial: true)];
-        SystemPromptCache snapshot = SystemPromptCache.Capture(model, tokens);
+        SystemPromptCache snapshot = await SystemPromptCache.CaptureAsync(model, tokens, new ParallelOptions());
 
         Assert.True(snapshot.IsPrefixOf([.. tokens, 999]));
         Assert.False(snapshot.IsPrefixOf([999, .. tokens]));
@@ -169,22 +169,22 @@ public class SystemPromptCacheTests
     }
 
     [Fact]
-    public void LoadOrCaptureWritesThenReusesTheFile()
+    public async Task LoadOrCaptureWritesThenReusesTheFile()
     {
         if (Model() is not { } modelPath) return;
 
         string path = Path.Combine(Path.GetTempPath(), $"shieldstral-lc-{Guid.NewGuid():N}.bin");
         try
         {
-            using var first = new ShieldstralModerator(modelPath, prefixCachePath: path);
+            using var first = await ShieldstralModerator.OpenAsync(modelPath, prefixCachePath: path);
             Assert.True(File.Exists(path));
             long size = new FileInfo(path).Length;
 
-            ModerationResult a = first.Moderate(Requests[0]);
+            ModerationResult a = await first.ModerateAsync(Requests[0]);
 
             // Second moderator loads the file rather than re-prefilling; same answer.
-            using var second = new ShieldstralModerator(modelPath, prefixCachePath: path);
-            ModerationResult b = second.Moderate(Requests[0]);
+            using var second = await ShieldstralModerator.OpenAsync(modelPath, prefixCachePath: path);
+            ModerationResult b = await second.ModerateAsync(Requests[0]);
 
             Assert.Equal(a.Score, b.Score);
             Assert.Equal(first.CachedPrefixTokens, second.CachedPrefixTokens);

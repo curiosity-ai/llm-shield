@@ -153,26 +153,69 @@ public class KernelTests
     [InlineData(1)]
     [InlineData(5)]
     [InlineData(400)]
-    public unsafe void QuantMatMulMatchesNaiveProduct(int tokens)
+    public async Task QuantMatMulMatchesNaiveProduct(int tokens)
     {
         const int rows = 37, cols = 64;
         float[] weights = Random(rows * cols, 31);
         float[] x = Random(tokens * cols, 41);
 
-        fixed (float* w = weights)
-        {
-            var matrix = new WeightMatrix(GgmlType.F32, (byte*)w, rows, cols);
-            var actual = new float[tokens * rows];
-            QuantMatMul.Forward(matrix, x, tokens, actual);
+        var actual = new float[tokens * rows];
+        await PinnedMatMul.ForwardAsync(GgmlType.F32, weights, rows, cols, x, tokens, actual);
 
-            for (int t = 0; t < tokens; t++)
-                for (int r = 0; r < rows; r++)
-                {
-                    double expected = 0;
-                    for (int k = 0; k < cols; k++) expected += (double)x[t * cols + k] * weights[r * cols + k];
-                    Numeric.Close(expected, actual[t * rows + r], 1e-5, $"C[{t},{r}]");
-                }
-        }
+        for (int t = 0; t < tokens; t++)
+            for (int r = 0; r < rows; r++)
+            {
+                double expected = 0;
+                for (int k = 0; k < cols; k++) expected += (double)x[t * cols + k] * weights[r * cols + k];
+                Numeric.Close(expected, actual[t * rows + r], 1e-5, $"C[{t},{r}]");
+            }
+    }
+
+    /// <summary>
+    /// Capping the fan-out must change only how long the product takes, never what
+    /// it is. The row chunks write to disjoint slices of the destination, so the
+    /// number of workers cannot reorder any accumulation — and this is what a host
+    /// relies on when it bounds the runtime to a fraction of the machine.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(-1)]
+    public async Task MaxDegreeOfParallelismDoesNotChangeTheResult(int workers)
+    {
+        const int rows = 200, cols = 128, tokens = 3;
+        float[] weights = Random(rows * cols, 17);
+        float[] x = Random(tokens * cols, 23);
+
+        var unbounded = new float[tokens * rows];
+        var bounded = new float[tokens * rows];
+
+        await PinnedMatMul.ForwardAsync(GgmlType.F32, weights, rows, cols, x, tokens, unbounded);
+        await PinnedMatMul.ForwardAsync(GgmlType.F32, weights, rows, cols, x, tokens, bounded,
+            new ParallelOptions { MaxDegreeOfParallelism = workers });
+
+        Assert.Equal(unbounded, bounded);
+    }
+
+    /// <summary>
+    /// The options' token is the caller's way out of a long prefill. It has to reach
+    /// the row loop, not just the entry point, or a cancelled request keeps a core
+    /// busy until the whole matmul finishes.
+    /// </summary>
+    [Fact]
+    public async Task ACancelledTokenStopsTheProduct()
+    {
+        const int rows = 4096, cols = 512, tokens = 2;
+        float[] weights = Random(rows * cols, 3);
+        float[] x = Random(tokens * cols, 4);
+        var destination = new float[tokens * rows];
+
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => PinnedMatMul.ForwardAsync(
+            GgmlType.F32, weights, rows, cols, x, tokens, destination,
+            new ParallelOptions { CancellationToken = cancellation.Token }));
     }
 
     /// <summary>
@@ -186,12 +229,12 @@ public class KernelTests
     /// <c>IntegerDotTests</c> covers that comparison separately.
     /// </remarks>
     [Fact]
-    public unsafe void QuantMatMulAgreesWithDequantizedWeights()
+    public async Task QuantMatMulAgreesWithDequantizedWeights()
     {
         QuantMatMul.Strategy = MatMulStrategy.Float;
         try
         {
-            AssertQuantizedMatchesDequantized();
+            await AssertQuantizedMatchesDequantized();
         }
         finally
         {
@@ -199,7 +242,7 @@ public class KernelTests
         }
     }
 
-    private static unsafe void AssertQuantizedMatchesDequantized()
+    private static async Task AssertQuantizedMatchesDequantized()
     {
         const int rows = 8, cols = 256;
         var rng = new Random(99);
@@ -215,21 +258,23 @@ public class KernelTests
 
         float[] x = Random(cols, 12);
         var dequantized = new float[rows * cols];
+        Dequantize(blocks, dequantized, rows, cols);
+
+        var fromQuantized = new float[rows];
+        await PinnedMatMul.ForwardAsync(GgmlType.Q8_0, blocks, rows, cols, x, 1, fromQuantized);
+
+        var fromFloat = new float[rows];
+        await PinnedMatMul.ForwardAsync(GgmlType.F32, dequantized, rows, cols, x, 1, fromFloat);
+
+        Numeric.Close(fromFloat, fromQuantized, 1e-6, "quantized vs dequantized");
+    }
+
+    private static unsafe void Dequantize(byte[] blocks, float[] destination, int rows, int cols)
+    {
         fixed (byte* p = blocks)
         {
             var quantized = new WeightMatrix(GgmlType.Q8_0, p, rows, cols);
-            for (int r = 0; r < rows; r++) quantized.DequantizeRow(r, dequantized.AsSpan(r * cols, cols));
-
-            var fromQuantized = new float[rows];
-            QuantMatMul.Forward(quantized, x, 1, fromQuantized);
-
-            fixed (float* d = dequantized)
-            {
-                var plain = new WeightMatrix(GgmlType.F32, (byte*)d, rows, cols);
-                var fromFloat = new float[rows];
-                QuantMatMul.Forward(plain, x, 1, fromFloat);
-                Numeric.Close(fromFloat, fromQuantized, 1e-6, "quantized vs dequantized");
-            }
+            for (int r = 0; r < rows; r++) quantized.DequantizeRow(r, destination.AsSpan(r * cols, cols));
         }
     }
 }

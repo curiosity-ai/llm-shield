@@ -39,7 +39,7 @@ public class ActivationParityTests
     }
 
     [Fact]
-    public void EveryRecordedTensorMatchesTheReference()
+    public async Task EveryRecordedTensorMatchesTheReference()
     {
         string? modelPath = Fixtures.ModelPath;
         if (modelPath is null)
@@ -61,7 +61,7 @@ public class ActivationParityTests
 
         var recorder = new Recorder();
         model.ResetKvCache();
-        model.Forward(tokens, recorder);
+        await model.ForwardAsync(tokens, recorder, new ParallelOptions());
 
         // Relative L2 error, not worst element. The reference runs unquantized and
         // the runtime reads Q8_0, so individual elements legitimately differ by a
@@ -150,7 +150,7 @@ public class ActivationParityTests
     /// swapping places if they are close.
     /// </summary>
     [Fact]
-    public void TopVerdictTokensMatchTheReference()
+    public async Task TopVerdictTokensMatchTheReference()
     {
         string? modelPath = Fixtures.ModelPath;
         if (modelPath is null)
@@ -166,7 +166,7 @@ public class ActivationParityTests
 
         using var model = new MinistralModel(modelPath);
         model.ResetKvCache();
-        float[] logits = model.Forward(tokens).ToArray();
+        float[] logits = (await model.ForwardAsync(tokens, new ParallelOptions())).ToArray();
 
         int[] actual = [.. Enumerable.Range(0, logits.Length)
             .OrderByDescending(i => logits[i]).Take(expected.Length)];

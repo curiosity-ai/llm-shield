@@ -27,8 +27,12 @@ public enum MatMulStrategy
 /// against it. Tiling the tokens keeps that activation slab inside L2, which is
 /// what stops a 150-token prefill from re-streaming the activations once per
 /// output row.
+///
+/// The row loop is the only place this library spends more than one core, so the
+/// caller's <see cref="ParallelOptions"/> is what bounds the whole runtime's CPU
+/// use — see <see cref="ForwardAsync(WeightMatrix, ReadOnlyMemory{float}, int, Memory{float}, ParallelOptions)"/>.
 /// </summary>
-public static unsafe class QuantMatMul
+public static class QuantMatMul
 {
     /// <summary>
     /// Which arithmetic to use. Process-wide, and intended for benchmarking and
@@ -46,10 +50,23 @@ public static unsafe class QuantMatMul
     /// Computes <paramref name="destination"/>[t, r] = dot(x[t, :], W[r, :]).
     /// <paramref name="x"/> is <paramref name="tokens"/> × <c>W.Cols</c> row-major;
     /// <paramref name="destination"/> is <paramref name="tokens"/> × <c>W.Rows</c>.
+    /// <para>
+    /// <paramref name="options"/> bounds the fan-out over rows and carries the
+    /// cancellation token; its <see cref="ParallelOptions.MaxDegreeOfParallelism"/>
+    /// is the knob a host uses to leave cores for everything else it is running.
+    /// </para>
     /// </summary>
-    public static void Forward(in WeightMatrix w, ReadOnlySpan<float> x, int tokens, Span<float> destination)
+    public static async ValueTask ForwardAsync(
+        WeightMatrix          w,
+        ReadOnlyMemory<float> x,
+        int                   tokens,
+        Memory<float>         destination,
+        ParallelOptions       options)
     {
+        ArgumentNullException.ThrowIfNull(options);
+
         int cols = w.Cols, rows = w.Rows;
+
         if (x.Length < (long)tokens * cols)
             throw new ArgumentException($"Expected {(long)tokens * cols} activations, got {x.Length}.", nameof(x));
         if (destination.Length < (long)tokens * rows)
@@ -64,37 +81,40 @@ public static unsafe class QuantMatMul
 
         if (useInteger)
         {
-            ForwardInteger(w, x, tokens, destination);
+            await ForwardIntegerAsync(w, x, tokens, destination, options).ConfigureAwait(false);
             return;
         }
 
         int tile = Math.Clamp(TokenTileBytes / (cols * sizeof(float)), 1, tokens);
+        int chunks = (rows + RowChunk - 1) / RowChunk;
 
-        fixed (float* xp = x)
-        fixed (float* yp = destination)
+        for (int t0 = 0; t0 < tokens; t0 += tile)
         {
-            float* xBase = xp, yBase = yp;
-            WeightMatrix weight = w;
+            int tokenStart = t0;
+            int tileLen = Math.Min(tile, tokens - t0);
 
-            for (int t0 = 0; t0 < tokens; t0 += tile)
+            // One token is a pure memory walk over the weights; splitting it
+            // across cores still helps, so parallelise on rows either way.
+            await Parallel.ForAsync(0, chunks, options, (chunk, _) =>
             {
-                int tileLen = Math.Min(tile, tokens - t0);
-                int chunks = (rows + RowChunk - 1) / RowChunk;
-
-                // One token is a pure memory walk over the weights; splitting it
-                // across cores still helps, so parallelise on rows either way.
-                Parallel.For(0, chunks, chunk =>
-                {
-                    int r0 = chunk * RowChunk;
-                    int r1 = Math.Min(r0 + RowChunk, rows);
-                    RunRowsFloat(weight, xBase, yBase, t0, tileLen, r0, r1, cols, rows);
-                });
-            }
+                int r0 = chunk * RowChunk;
+                int r1 = Math.Min(r0 + RowChunk, rows);
+                RunRowsFloat(w, x.Span, destination.Span, tokenStart, tileLen, r0, r1, cols, rows);
+                return ValueTask.CompletedTask;
+            }).ConfigureAwait(false);
         }
     }
 
-    private static void RunRowsFloat(
-        WeightMatrix w, float* x, float* y,
+    /// <summary>
+    /// Single-token convenience overload — the decode path, where the whole
+    /// forward pass is one row of activations.
+    /// </summary>
+    public static ValueTask ForwardAsync(
+        WeightMatrix w, ReadOnlyMemory<float> x, Memory<float> destination, ParallelOptions options)
+        => ForwardAsync(w, x, tokens: 1, destination, options);
+
+    private static unsafe void RunRowsFloat(
+        WeightMatrix w, ReadOnlySpan<float> x, Span<float> y,
         int tokenStart, int tokenCount, int rowStart, int rowEnd, int cols, int rows)
     {
         bool needsDecode = w.Type != GgmlType.F32;
@@ -119,8 +139,8 @@ public static unsafe class QuantMatMul
                     var wSpan = new ReadOnlySpan<float>(weightRow, cols);
                     for (int t = 0; t < tokenCount; t++)
                     {
-                        var xSpan = new ReadOnlySpan<float>(x + (long)(tokenStart + t) * cols, cols);
-                        y[(long)(tokenStart + t) * rows + r] = TensorPrimitives.Dot(xSpan, wSpan);
+                        var xSpan = x.Slice((tokenStart + t) * cols, cols);
+                        y[(tokenStart + t) * rows + r] = TensorPrimitives.Dot(xSpan, wSpan);
                     }
                 }
             }
@@ -139,7 +159,12 @@ public static unsafe class QuantMatMul
     /// nothing to gain from tiling them here, and one pass keeps the code honest
     /// about where the cost actually is.
     /// </summary>
-    private static void ForwardInteger(in WeightMatrix w, ReadOnlySpan<float> x, int tokens, Span<float> destination)
+    private static async ValueTask ForwardIntegerAsync(
+        WeightMatrix          w,
+        ReadOnlyMemory<float> x,
+        int                   tokens,
+        Memory<float>         destination,
+        ParallelOptions       options)
     {
         int cols = w.Cols, rows = w.Rows;
         int quantizedRowBytes = cols / IntegerDot.BlockSize * IntegerDot.ActivationBlockBytes;
@@ -151,71 +176,18 @@ public static unsafe class QuantMatMul
         float[] activationSums = ArrayPool<float>.Shared.Rent(blocks * tokens);
         try
         {
-            for (int t = 0; t < tokens; t++)
-                IntegerDot.QuantizeActivations(
-                    x.Slice(t * cols, cols),
-                    quantized.AsSpan(t * quantizedRowBytes, quantizedRowBytes),
-                    hasOffset ? activationSums.AsSpan(t * blocks, blocks) : default);
+            QuantizeActivations(x.Span, quantized, activationSums, tokens, cols, blocks, quantizedRowBytes, hasOffset);
 
-            fixed (byte* qp = quantized)
-            fixed (float* sp = activationSums)
-            fixed (float* yp = destination)
+            int chunks = (rows + RowChunk - 1) / RowChunk;
+
+            await Parallel.ForAsync(0, chunks, options, (chunk, _) =>
             {
-                byte* activations = qp;
-                float* sums = sp;
-                float* y = yp;
-                WeightMatrix weight = w;
-                int chunks = (rows + RowChunk - 1) / RowChunk;
-
-                Parallel.For(0, chunks, chunk =>
-                {
-                    // Unpack once per row, dot once per (row, token) — the same
-                    // amortisation the float path gets from decoding a row once.
-                    sbyte[] values = ArrayPool<sbyte>.Shared.Rent(cols);
-                    float[] scales = ArrayPool<float>.Shared.Rent(blocks);
-                    float[] offsets = ArrayPool<float>.Shared.Rent(blocks);
-                    try
-                    {
-                        fixed (sbyte* v = values)
-                        fixed (float* s = scales)
-                        fixed (float* o = offsets)
-                        {
-                            float* offsetPtr = hasOffset ? o : null;
-                            int r0 = chunk * RowChunk;
-                            int r1 = Math.Min(r0 + RowChunk, rows);
-                            bool packedQ8 = weight.Type == GgmlType.Q8_0;
-                            for (int r = r0; r < r1; r++)
-                            {
-                                byte* row = weight.Row(r);
-                                if (packedQ8)
-                                {
-                                    for (int t = 0; t < tokens; t++)
-                                        y[(long)t * rows + r] = IntegerDot.DotPackedQ8_0(
-                                            row, activations + (long)t * quantizedRowBytes, blocks);
-                                    continue;
-                                }
-
-                                IntegerDot.UnpackRow(weight.Type, row, v, s, offsetPtr, blocks);
-                                for (int t = 0; t < tokens; t++)
-                                {
-                                    float value = IntegerDot.DotUnpacked(
-                                        v, s, activations + (long)t * quantizedRowBytes, blocks);
-                                    if (offsetPtr is not null)
-                                        value += IntegerDot.OffsetContribution(
-                                            offsetPtr, sums + (long)t * blocks, blocks);
-                                    y[(long)t * rows + r] = value;
-                                }
-                            }
-                        }
-                    }
-                    finally
-                    {
-                        ArrayPool<sbyte>.Shared.Return(values);
-                        ArrayPool<float>.Shared.Return(scales);
-                        ArrayPool<float>.Shared.Return(offsets);
-                    }
-                });
-            }
+                int r0 = chunk * RowChunk;
+                int r1 = Math.Min(r0 + RowChunk, rows);
+                RunRowsInteger(w, quantized, activationSums, destination.Span,
+                               tokens, r0, r1, cols, rows, blocks, quantizedRowBytes, hasOffset);
+                return ValueTask.CompletedTask;
+            }).ConfigureAwait(false);
         }
         finally
         {
@@ -224,12 +196,71 @@ public static unsafe class QuantMatMul
         }
     }
 
-    /// <summary>
-    /// Single-token convenience overload — the decode path, where the whole
-    /// forward pass is one row of activations.
-    /// </summary>
-    public static void Forward(in WeightMatrix w, ReadOnlySpan<float> x, Span<float> destination)
-        => Forward(w, x, tokens: 1, destination);
+    private static void QuantizeActivations(
+        ReadOnlySpan<float> x, byte[] quantized, float[] activationSums,
+        int tokens, int cols, int blocks, int quantizedRowBytes, bool hasOffset)
+    {
+        for (int t = 0; t < tokens; t++)
+        {
+            IntegerDot.QuantizeActivations(
+                x.Slice(t * cols, cols),
+                quantized.AsSpan(t * quantizedRowBytes, quantizedRowBytes),
+                hasOffset ? activationSums.AsSpan(t * blocks, blocks) : default);
+        }
+    }
+
+    private static unsafe void RunRowsInteger(
+        WeightMatrix w, byte[] quantized, float[] activationSums, Span<float> y,
+        int tokens, int rowStart, int rowEnd, int cols, int rows,
+        int blocks, int quantizedRowBytes, bool hasOffset)
+    {
+        // Unpack once per row, dot once per (row, token) — the same
+        // amortisation the float path gets from decoding a row once.
+        sbyte[] values = ArrayPool<sbyte>.Shared.Rent(cols);
+        float[] scales = ArrayPool<float>.Shared.Rent(blocks);
+        float[] offsets = ArrayPool<float>.Shared.Rent(blocks);
+        try
+        {
+            fixed (byte* activations = quantized)
+            fixed (float* sums = activationSums)
+            fixed (sbyte* v = values)
+            fixed (float* s = scales)
+            fixed (float* o = offsets)
+            {
+                float* offsetPtr = hasOffset ? o : null;
+                bool packedQ8 = w.Type == GgmlType.Q8_0;
+
+                for (int r = rowStart; r < rowEnd; r++)
+                {
+                    byte* row = w.Row(r);
+                    if (packedQ8)
+                    {
+                        for (int t = 0; t < tokens; t++)
+                            y[t * rows + r] = IntegerDot.DotPackedQ8_0(
+                                row, activations + (long)t * quantizedRowBytes, blocks);
+                        continue;
+                    }
+
+                    IntegerDot.UnpackRow(w.Type, row, v, s, offsetPtr, blocks);
+                    for (int t = 0; t < tokens; t++)
+                    {
+                        float value = IntegerDot.DotUnpacked(
+                            v, s, activations + (long)t * quantizedRowBytes, blocks);
+                        if (offsetPtr is not null)
+                            value += IntegerDot.OffsetContribution(
+                                offsetPtr, sums + (long)t * blocks, blocks);
+                        y[t * rows + r] = value;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<sbyte>.Shared.Return(values);
+            ArrayPool<float>.Shared.Return(scales);
+            ArrayPool<float>.Shared.Return(offsets);
+        }
+    }
 
     /// <summary>
     /// Gathers embedding rows for <paramref name="tokenIds"/> out of a quantized
