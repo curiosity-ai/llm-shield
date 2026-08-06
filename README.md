@@ -10,8 +10,13 @@ plain language, a yes/no question and the content, and it answers with a single
 token — so one forward pass, no sampling loop, and the whole verdict lives in the
 first token's distribution.
 
+```bash
+dotnet add package LlmShield.Shieldstral
+```
+
 ```csharp
-using var moderator = new ShieldstralModerator("Shieldstral-1.0-3B-Q8_0.gguf");
+// Downloads the model on first use (~1.8-2.4 GiB) and caches it; opens it directly after that.
+using var moderator = await ShieldstralModerator.CreateAsync(ShieldstralQuantization.Q4_0);
 
 ModerationResult result = moderator.Moderate(
     instruct: "You are a strict safety moderator reviewing potentially harmful content. " +
@@ -33,7 +38,7 @@ default, not a law — `IsUnsafeAt(threshold)` lets you move it.
 | project | what it does |
 |---|---|
 | `src/LlmShield.Shieldstral` | the runtime: GGUF, quantization, tokenizer, model, moderator |
-| `src/LlmShield.Shieldstral.Cli` | `shieldstral` — moderate, inspect, tokenize, dump, bench |
+| `src/LlmShield.Shieldstral.Cli` | `shieldstral` — download, moderate, inspect, tokenize, dump, bench |
 | `tests/LlmShield.Shieldstral.Tests` | parity and unit tests |
 | `tools/` | Python: weight conversion, the reference implementation, fixture generation |
 
@@ -45,7 +50,47 @@ derived logic say so in their header.
 
 ## Getting a model
 
-The runtime reads GGUF. Convert Mistral's official release once:
+A GGUF is the whole model — weights, hyperparameters and vocabulary in one file —
+so there is nothing else to ship and nothing to configure. Take a converted one,
+or convert it yourself.
+
+### Pre-converted
+
+Three are published, all on the integer matmul path:
+
+| | size | `ShieldstralQuantization` |
+|---|---|---|
+| [`Shieldstral-1.0-3B-Q5_1.gguf`](https://models.curiosity.ai/shieldstral/Shieldstral-1.0-3B-Q5_1.gguf) | 2.40 GiB | `Q5_1` — closest to the original weights |
+| [`Shieldstral-1.0-3B-Q5_0.gguf`](https://models.curiosity.ai/shieldstral/Shieldstral-1.0-3B-Q5_0.gguf) | 2.20 GiB | `Q5_0` |
+| [`Shieldstral-1.0-3B-Q4_0.gguf`](https://models.curiosity.ai/shieldstral/Shieldstral-1.0-3B-Q4_0.gguf) | 1.80 GiB | `Q4_0` — smallest, and the fastest to decode |
+
+`ShieldstralModerator.CreateAsync` fetches one on first use and opens it directly
+on every run after that:
+
+```csharp
+using var moderator = await ShieldstralModerator.CreateAsync(
+    ShieldstralQuantization.Q4_0,
+    downloadToPath: "/var/lib/myapp/shieldstral.gguf",   // defaults to a temp folder
+    reportProgress: p => Console.Write($"\r{p.Fraction:P0}"));
+```
+
+The transfer resumes, including across process restarts: bytes land in a
+`.download` sidecar and are renamed into place only once the file is complete, so
+a path that exists is always a file worth memory-mapping. It refuses to start
+when the disk cannot hold the result, and it will not resume a partial file whose
+entity tag no longer matches the server's — resuming into a republished model
+would produce something the right length and wrong throughout.
+
+Or from the command line, if you would rather have the file first:
+
+```bash
+dotnet run --project src/LlmShield.Shieldstral.Cli -c Release -- download q4_0 --to model.gguf
+```
+
+### Converting it yourself
+
+Any other quantization — and the vision tower — means running the converter over
+Mistral's official release:
 
 ```bash
 pip install gguf numpy
@@ -91,7 +136,8 @@ dotnet run --project src/LlmShield.Shieldstral.Cli -c Release -- \
 ```
 
 `--json` emits a machine-readable result; `--document-file` or stdin takes the
-content from a file. `inspect` prints a GGUF's metadata and tensor breakdown,
+content from a file. `download` fetches a converted model, `inspect` prints a
+GGUF's metadata and tensor breakdown,
 `tokenize` shows token ids and pieces, `dump` records per-layer activations for
 the parity harness, and `bench` runs the benchmark suite.
 

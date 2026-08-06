@@ -26,6 +26,7 @@ internal static class Program
         {
             return args[0] switch
             {
+                "download" => Download(args[1..]),
                 "moderate" => Moderate(args[1..]),
                 "inspect" => Inspect(args[1..]),
                 "tokenize" => Tokenize(args[1..]),
@@ -35,7 +36,8 @@ internal static class Program
             };
         }
         catch (Exception e) when (e is FileNotFoundException or KeyNotFoundException
-                                    or InvalidDataException or NotSupportedException)
+                                    or InvalidDataException or NotSupportedException
+                                    or IOException or HttpRequestException)
         {
             Console.Error.WriteLine($"error: {e.Message}");
             return 1;
@@ -62,6 +64,7 @@ internal static class Program
     private static void Usage() => Console.Error.WriteLine("""
         shieldstral — Mistral Shieldstral 1.0 3B safety classifier
 
+          download [q5_1|q5_0|q4_0] [--to PATH]          fetch a converted model (resumable)
           moderate <model.gguf> --instruct TEXT --query TEXT --document TEXT [--json]
                                 [--document-file PATH] [--no-prefix-cache] [--prefix-cache PATH]
           inspect  <model.gguf>                          print metadata and tensor summary
@@ -70,6 +73,60 @@ internal static class Program
           bench    [<model.gguf|dir> ...] [--json out.json] [--no-micro] [--no-model]
                    [--prefill-tokens N] [--decode-tokens N] [--warmups N] [--repeats N]
         """);
+
+    // ------------------------------------------------------------- download
+
+    private static int Download(string[] args)
+    {
+        var quantization = ShieldstralQuantization.Q5_1;
+        string? destination = null;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--to": destination = Next(args, ref i); break;
+                default:
+                    if (!Enum.TryParse(args[i], ignoreCase: true, out quantization))
+                    {
+                        Console.Error.WriteLine(
+                            $"error: unknown model '{args[i]}' — expected one of {string.Join(", ", Enum.GetNames<ShieldstralQuantization>())}");
+                        return 2;
+                    }
+                    break;
+            }
+        }
+
+        string path = destination ?? ModelDownloader.DefaultPathFor(quantization);
+        if (File.Exists(path))
+        {
+            Console.WriteLine($"{path} is already there ({new FileInfo(path).Length / (1024.0 * 1024 * 1024):F2} GiB)");
+            return 0;
+        }
+
+        Console.Error.WriteLine($"{ModelDownloader.UrlFor(quantization)}\n  -> {path}");
+        bool tty = !Console.IsOutputRedirected;
+        long lastLine = -1;
+
+        ModelDownloader.EnsureModelAsync(quantization, path, Progress).GetAwaiter().GetResult();
+
+        if (tty) Console.Error.WriteLine();
+        Console.WriteLine(path);
+        return 0;
+
+        void Progress(DownloadProgress p)
+        {
+            // Without a terminal the carriage return would produce one enormous line
+            // in a log file, so redirected output gets a line every 5%.
+            long bucket = tty ? 0 : (long)(p.Fraction * 20);
+            if (!tty && bucket == lastLine) return;
+            lastLine = bucket;
+
+            string total = p.TotalBytes is long t ? $" / {t / (1024.0 * 1024 * 1024):F2} GiB" : string.Empty;
+            string line = $"  {p.DownloadedBytes / (1024.0 * 1024 * 1024):F2} GiB{total}  {p.Fraction:P1}";
+            Console.Error.Write(tty ? $"\r{line}   " : line + "\n");
+        }
+    }
 
     // ------------------------------------------------------------- moderate
 

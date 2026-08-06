@@ -3,10 +3,21 @@
   <PropertyGroup>
     <RootNamespace>LlmShield.Shieldstral</RootNamespace>
     <AssemblyName>LlmShield.Shieldstral</AssemblyName>
+  </PropertyGroup>
+
+  <PropertyGroup>
     <IsPackable>true</IsPackable>
     <PackageId>LlmShield.Shieldstral</PackageId>
-    <Description>Self-contained managed .NET runtime for Mistral's Shieldstral 1.0 3B safety classifier, reading GGUF weights directly.</Description>
-    <PackageTags>llm;guardrail;moderation;shieldstral;mistral;gguf;inference</PackageTags>
+    <Authors>Curiosity GmbH, Zhongkai Fu</Authors>
+    <Copyright>(c) Copyright 2026 Curiosity GmbH - all rights reserved, Copyright (c) Zhongkai Fu (TensorSharp)</Copyright>
+    <!-- An absolute URI, or NuGet silently drops it from the nuspec. -->
+    <PackageProjectUrl>https://curiosity.ai</PackageProjectUrl>
+    <!-- The licence and repository URL are shared; see Directory.Build.props. -->
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>A 100% managed, dependency-free runtime for Mistral's Shieldstral 1.0 3B safety classifier. Reads GGUF weights directly — every quantization type, memory-mapped, no llama.cpp and no native library — and scores content with one forward pass over a cached system prompt.</Description>
+    <PackageTags>Shieldstral, Mistral, Ministral, Guardrails, Content Moderation, Safety, Classifier, LLM, GGUF, Quantization, Inference, Pure CSharp, No Native Dependencies, Natural Language Processing, NLP, Machine Learning, ML, Artificial Intelligence, AI</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +26,12 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="LlmShield.Shieldstral.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The licence this code is carried under travels with the package, not just with the repo. -->
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\third-party\TensorSharp-LICENSE" Pack="true" PackagePath="third-party\" />
   </ItemGroup>
 
 </Project>

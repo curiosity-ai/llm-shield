@@ -7,7 +7,7 @@ Working notes for the port. Checked items are done and covered by tests; the
 
 - [x] `net10.0` library `LlmShield.Shieldstral`, no native dependencies
 - [x] xunit test project, fixtures copied to the test output
-- [x] `shieldstral` CLI (`moderate`, `inspect`, `tokenize`, `dump`, `bench`)
+- [x] `shieldstral` CLI (`download`, `moderate`, `inspect`, `tokenize`, `dump`, `bench`)
 - [x] `LlmShield.slnx`, `Directory.Build.props` (server GC, tiered PGO, unsafe on)
 - [x] TensorSharp's BSD-3-Clause licence carried in `third-party/TensorSharp-LICENSE`,
       and every file derived from it says so in its header
@@ -115,7 +115,24 @@ Reading is complete. Writing is the converter's job and covers what the referenc
       quantization, with the safety score alongside so accuracy loss is visible
 - [ ] Track the numbers over time rather than pasting them into the README
 
-## 10. Vision
+## 10. Distribution
+
+- [x] `ModelDownloader`: fetches the Q5_1/Q5_0/Q4_0 builds published at
+      models.curiosity.ai, with progress reporting and a one-call
+      `ShieldstralModerator.CreateAsync`
+- [x] Resumable across process restarts — `.download` sidecar renamed into place
+      only when complete, so a file that exists is always loadable
+- [x] A partial file is only reused when the size *and* entity tag still match the
+      server; a republished model restarts the download instead of splicing
+- [x] Size and range support learned from a one-byte ranged GET, because the host
+      answers HEAD with 405
+- [x] Free-space check before starting, and a disk-full failure that says so
+      instead of retrying eight times
+- [x] `LlmShield.Shieldstral` packs for NuGet (README and TensorSharp's licence
+      included); `.devops/azure-pipelines.yml` builds, tests and pushes on `main`
+- [ ] Publish an mmproj alongside the three text models, once the vision path runs
+
+## 11. Vision
 
 - [x] Converter emits the Pixtral tower and projector
 - [x] `[IMG]` placement in the prompt template — `ChatTemplateTests`
@@ -126,7 +143,7 @@ Reading is complete. Writing is the converter's job and covers what the referenc
 Text moderation is complete and validated; the vision path is converted but not
 yet executed. `ShieldstralModerator` is text-only today.
 
-## 11. Documentation
+## 12. Documentation
 
 - [x] `README.md` — what it is, how to convert, how to run
 - [x] `CLAUDE.md` — layout, invariants, how to regenerate fixtures
