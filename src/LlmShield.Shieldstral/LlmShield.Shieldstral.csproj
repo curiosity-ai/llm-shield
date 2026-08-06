@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>LlmShield.Shieldstral</RootNamespace>
+    <AssemblyName>LlmShield.Shieldstral</AssemblyName>
+    <IsPackable>true</IsPackable>
+    <PackageId>LlmShield.Shieldstral</PackageId>
+    <Description>Self-contained managed .NET runtime for Mistral's Shieldstral 1.0 3B safety classifier, reading GGUF weights directly.</Description>
+    <PackageTags>llm;guardrail;moderation;shieldstral;mistral;gguf;inference</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="LlmShield.Shieldstral.Tests" />
+  </ItemGroup>
+
+</Project>

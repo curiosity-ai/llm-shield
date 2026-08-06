@@ -1,0 +1,551 @@
+{
+  "environment": {
+    "dotnet": "10.0.10",
+    "os": "Ubuntu 24.04.4 LTS",
+    "arch": "X64",
+    "processors": 4,
+    "vector_bits": 256,
+    "vector256": true,
+    "vector512": false,
+    "server_gc": true,
+    "total_ram_bytes": 16856059904
+  },
+  "dequantize": [
+    {
+      "type": "F32",
+      "bits_per_weight": 32,
+      "melem_per_s": 3881.642921660347,
+      "weight_mib_per_s": 14807.292639390362
+    },
+    {
+      "type": "F16",
+      "bits_per_weight": 16,
+      "melem_per_s": 386.2286410967582,
+      "weight_mib_per_s": 736.6726705489316
+    },
+    {
+      "type": "Q4_0",
+      "bits_per_weight": 4.5,
+      "melem_per_s": 969.0159380136654,
+      "weight_mib_per_s": 519.8206569029682
+    },
+    {
+      "type": "Q4_1",
+      "bits_per_weight": 5,
+      "melem_per_s": 913.749752953113,
+      "weight_mib_per_s": 544.6372943837124
+    },
+    {
+      "type": "Q5_0",
+      "bits_per_weight": 5.5,
+      "melem_per_s": 768.3740105333202,
+      "weight_mib_per_s": 503.78525947728883
+    },
+    {
+      "type": "Q5_1",
+      "bits_per_weight": 6,
+      "melem_per_s": 749.4273468249696,
+      "weight_mib_per_s": 536.0322095095894
+    },
+    {
+      "type": "Q8_0",
+      "bits_per_weight": 8.5,
+      "melem_per_s": 1524.5575075985494,
+      "weight_mib_per_s": 1544.8020475611293
+    },
+    {
+      "type": "Q8_1",
+      "bits_per_weight": 9,
+      "melem_per_s": 1244.0795498444281,
+      "weight_mib_per_s": 1334.75255353449
+    },
+    {
+      "type": "Q2_K",
+      "bits_per_weight": 2.625,
+      "melem_per_s": 421.2940051522246,
+      "weight_mib_per_s": 131.83316749627465
+    },
+    {
+      "type": "Q3_K",
+      "bits_per_weight": 3.4375,
+      "melem_per_s": 461.08943000054967,
+      "weight_mib_per_s": 188.94611783348196
+    },
+    {
+      "type": "Q4_K",
+      "bits_per_weight": 4.5,
+      "melem_per_s": 705.5710813394925,
+      "weight_mib_per_s": 378.49782300325825
+    },
+    {
+      "type": "Q5_K",
+      "bits_per_weight": 5.5,
+      "melem_per_s": 549.7167905561381,
+      "weight_mib_per_s": 360.4224143098307
+    },
+    {
+      "type": "Q6_K",
+      "bits_per_weight": 6.5625,
+      "melem_per_s": 417.04661166383175,
+      "weight_mib_per_s": 326.260136251914
+    },
+    {
+      "type": "Q8_K",
+      "bits_per_weight": 9.125,
+      "melem_per_s": 1019.1751662971175,
+      "weight_mib_per_s": 1108.6432209564682
+    },
+    {
+      "type": "IQ2_XXS",
+      "bits_per_weight": 2.0625,
+      "melem_per_s": 199.58583191842263,
+      "weight_mib_per_s": 49.072000781505906
+    },
+    {
+      "type": "IQ2_XS",
+      "bits_per_weight": 2.3125,
+      "melem_per_s": 179.2506958248041,
+      "weight_mib_per_s": 49.41430498300307
+    },
+    {
+      "type": "IQ3_XXS",
+      "bits_per_weight": 3.0625,
+      "melem_per_s": 160.5803822021987,
+      "weight_mib_per_s": 58.62443691423339
+    },
+    {
+      "type": "IQ1_S",
+      "bits_per_weight": 1.5625,
+      "melem_per_s": 729.732867908724,
+      "weight_mib_per_s": 135.92333866445793
+    },
+    {
+      "type": "IQ4_NL",
+      "bits_per_weight": 4.5,
+      "melem_per_s": 1012.0043304007069,
+      "weight_mib_per_s": 542.8814276222206
+    },
+    {
+      "type": "IQ3_S",
+      "bits_per_weight": 3.4375,
+      "melem_per_s": 133.61726320381123,
+      "weight_mib_per_s": 54.75394037522091
+    },
+    {
+      "type": "IQ2_S",
+      "bits_per_weight": 2.5625,
+      "melem_per_s": 173.4251187233984,
+      "weight_mib_per_s": 52.976830807770305
+    },
+    {
+      "type": "IQ4_XS",
+      "bits_per_weight": 4.25,
+      "melem_per_s": 787.5337757950257,
+      "weight_mib_per_s": 398.9957031165194
+    },
+    {
+      "type": "I8",
+      "bits_per_weight": 8,
+      "melem_per_s": 1372.5602742303633,
+      "weight_mib_per_s": 1308.9754812530168
+    },
+    {
+      "type": "I16",
+      "bits_per_weight": 16,
+      "melem_per_s": 1317.3247473081428,
+      "weight_mib_per_s": 2512.5975557482584
+    },
+    {
+      "type": "I32",
+      "bits_per_weight": 32,
+      "melem_per_s": 1296.3457160807784,
+      "weight_mib_per_s": 4945.166458438028
+    },
+    {
+      "type": "I64",
+      "bits_per_weight": 64,
+      "melem_per_s": 1365.9989736617163,
+      "weight_mib_per_s": 10421.74509934781
+    },
+    {
+      "type": "F64",
+      "bits_per_weight": 64,
+      "melem_per_s": 1455.780771393545,
+      "weight_mib_per_s": 11106.725855968818
+    },
+    {
+      "type": "IQ1_M",
+      "bits_per_weight": 1.75,
+      "melem_per_s": 532.730577359698,
+      "weight_mib_per_s": 111.13625888579745
+    },
+    {
+      "type": "BF16",
+      "bits_per_weight": 16,
+      "melem_per_s": 1435.6039834402743,
+      "weight_mib_per_s": 2738.197295074986
+    },
+    {
+      "type": "TQ1_0",
+      "bits_per_weight": 1.6875,
+      "melem_per_s": 504.28134613450015,
+      "weight_mib_per_s": 101.44409794830906
+    },
+    {
+      "type": "TQ2_0",
+      "bits_per_weight": 2.0625,
+      "melem_per_s": 731.7958639054536,
+      "weight_mib_per_s": 179.92603412926175
+    },
+    {
+      "type": "MXFP4",
+      "bits_per_weight": 4.25,
+      "melem_per_s": 815.0951851926662,
+      "weight_mib_per_s": 412.95940125809096
+    }
+  ],
+  "matmul": [
+    {
+      "type": "Q8_0",
+      "tokens": 1,
+      "float_gflops": 6.3269028789500155,
+      "integer_gflops": 26.598092053546438,
+      "relative_l2_error": 0.0037545706833851536
+    },
+    {
+      "type": "Q8_0",
+      "tokens": 64,
+      "float_gflops": 46.15145829822261,
+      "integer_gflops": 44.68126045691632,
+      "relative_l2_error": 0.003763288606695841
+    },
+    {
+      "type": "Q5_1",
+      "tokens": 1,
+      "float_gflops": 4.377261040670867,
+      "integer_gflops": 5.510844829851531,
+      "relative_l2_error": 0.002545024582009228
+    },
+    {
+      "type": "Q5_1",
+      "tokens": 64,
+      "float_gflops": 44.29174836897875,
+      "integer_gflops": 44.555199048164546,
+      "relative_l2_error": 0.0032430672701973884
+    },
+    {
+      "type": "Q5_0",
+      "tokens": 1,
+      "float_gflops": 3.8942706397237163,
+      "integer_gflops": 4.842745465498997,
+      "relative_l2_error": 0.0036592960917889573
+    },
+    {
+      "type": "Q5_0",
+      "tokens": 64,
+      "float_gflops": 44.27564207532324,
+      "integer_gflops": 58.78939291990606,
+      "relative_l2_error": 0.003770210545521006
+    },
+    {
+      "type": "Q4_1",
+      "tokens": 1,
+      "float_gflops": 5.123134003349157,
+      "integer_gflops": 6.825109287830372,
+      "relative_l2_error": 0.003015496210529439
+    },
+    {
+      "type": "Q4_1",
+      "tokens": 64,
+      "float_gflops": 44.01121794818411,
+      "integer_gflops": 45.9235951775569,
+      "relative_l2_error": 0.003560995937594587
+    },
+    {
+      "type": "Q4_0",
+      "tokens": 1,
+      "float_gflops": 5.486633386803097,
+      "integer_gflops": 8.163404343474609,
+      "relative_l2_error": 0.003646413844962318
+    },
+    {
+      "type": "Q4_0",
+      "tokens": 64,
+      "float_gflops": 46.65753706197346,
+      "integer_gflops": 60.37211820936698,
+      "relative_l2_error": 0.0037535252931849344
+    },
+    {
+      "type": "Q4_K",
+      "tokens": 1,
+      "float_gflops": 3.811073718897905,
+      "integer_gflops": "",
+      "relative_l2_error": ""
+    },
+    {
+      "type": "Q4_K",
+      "tokens": 64,
+      "float_gflops": 45.666807408062,
+      "integer_gflops": "",
+      "relative_l2_error": ""
+    },
+    {
+      "type": "Q6_K",
+      "tokens": 1,
+      "float_gflops": 2.5027484047154056,
+      "integer_gflops": "",
+      "relative_l2_error": ""
+    },
+    {
+      "type": "Q6_K",
+      "tokens": 64,
+      "float_gflops": 39.22164672305237,
+      "integer_gflops": "",
+      "relative_l2_error": ""
+    },
+    {
+      "type": "F32",
+      "tokens": 1,
+      "float_gflops": 19.224290705539495,
+      "integer_gflops": "",
+      "relative_l2_error": ""
+    },
+    {
+      "type": "F32",
+      "tokens": 64,
+      "float_gflops": 47.8044523476281,
+      "integer_gflops": "",
+      "relative_l2_error": ""
+    }
+  ],
+  "models": {
+    "Float": [
+      {
+        "model": "TQ2_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-TQ2_0.gguf",
+        "file_bytes": 889944640,
+        "load_seconds": 0.0825429,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 7.174045956319365,
+        "decode_tokens_per_second": 0.6673214814313335,
+        "rss_bytes_before": 109039616,
+        "rss_bytes_after": 1135067136,
+        "managed_allocated_bytes": 227816432,
+        "safety_score": 0.030626103281974792,
+        "reference_score": 0.997343,
+        "score_delta": 0.9667168967180252,
+        "strategy": "Float"
+      },
+      {
+        "model": "MXFP4",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-MXFP4.gguf",
+        "file_bytes": 1827519040,
+        "load_seconds": 0.1270104,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 7.141898087971044,
+        "decode_tokens_per_second": 0.9245445237182305,
+        "rss_bytes_before": 245121024,
+        "rss_bytes_after": 2146553856,
+        "managed_allocated_bytes": 230313472,
+        "safety_score": 0.9943209886550903,
+        "reference_score": 0.997343,
+        "score_delta": 0.0030220113449096475,
+        "strategy": "Float"
+      },
+      {
+        "model": "Q4_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q4_0.gguf",
+        "file_bytes": 1934670400,
+        "load_seconds": 0.1901044,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 6.958815847306209,
+        "decode_tokens_per_second": 0.8323090210250206,
+        "rss_bytes_before": 319086592,
+        "rss_bytes_after": 2233266176,
+        "managed_allocated_bytes": 229734208,
+        "safety_score": 0.9986868500709534,
+        "reference_score": 0.997343,
+        "score_delta": 0.0013438500709533896,
+        "strategy": "Float"
+      },
+      {
+        "model": "Q4_1",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q4_1.gguf",
+        "file_bytes": 2148973120,
+        "load_seconds": 0.3556453,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 7.1793537116014905,
+        "decode_tokens_per_second": 0.8142931575068119,
+        "rss_bytes_before": 298594304,
+        "rss_bytes_after": 2524454912,
+        "managed_allocated_bytes": 230369272,
+        "safety_score": 0.9962037205696106,
+        "reference_score": 0.997343,
+        "score_delta": 0.0011392794303893838,
+        "strategy": "Float"
+      },
+      {
+        "model": "Q5_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q5_0.gguf",
+        "file_bytes": 2363275840,
+        "load_seconds": 0.2889368,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 6.915675516985834,
+        "decode_tokens_per_second": 0.6567655699516287,
+        "rss_bytes_before": 375533568,
+        "rss_bytes_after": 2712694784,
+        "managed_allocated_bytes": 231065408,
+        "safety_score": 0.9969711303710938,
+        "reference_score": 0.997343,
+        "score_delta": 0.00037186962890622954,
+        "strategy": "Float"
+      },
+      {
+        "model": "Q5_1",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q5_1.gguf",
+        "file_bytes": 2577578560,
+        "load_seconds": 0.4836514,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 7.015080057172856,
+        "decode_tokens_per_second": 0.6260099055894899,
+        "rss_bytes_before": 349421568,
+        "rss_bytes_after": 2952028160,
+        "managed_allocated_bytes": 230518920,
+        "safety_score": 0.9973946809768677,
+        "reference_score": 0.997343,
+        "score_delta": 5.168097686769624E-05,
+        "strategy": "Float"
+      },
+      {
+        "model": "Q8_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q8_0.gguf",
+        "file_bytes": 3649092160,
+        "load_seconds": 0.2825488,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 7.097979565101996,
+        "decode_tokens_per_second": 0.9772322595851368,
+        "rss_bytes_before": 374468608,
+        "rss_bytes_after": 3978002432,
+        "managed_allocated_bytes": 230896592,
+        "safety_score": 0.9973070621490479,
+        "reference_score": 0.997343,
+        "score_delta": 3.593785095212798E-05,
+        "strategy": "Float"
+      }
+    ],
+    "Auto": [
+      {
+        "model": "TQ2_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-TQ2_0.gguf",
+        "file_bytes": 889944640,
+        "load_seconds": 0.0501738,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 6.874992616280923,
+        "decode_tokens_per_second": 0.6608492547338615,
+        "rss_bytes_before": 328908800,
+        "rss_bytes_after": 1283031040,
+        "managed_allocated_bytes": 229848968,
+        "safety_score": 0.030626103281974792,
+        "reference_score": 0.997343,
+        "score_delta": 0.9667168967180252,
+        "strategy": "Auto"
+      },
+      {
+        "model": "MXFP4",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-MXFP4.gguf",
+        "file_bytes": 1827519040,
+        "load_seconds": 0.2332747,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 6.9814287480857375,
+        "decode_tokens_per_second": 0.9230340197456591,
+        "rss_bytes_before": 393129984,
+        "rss_bytes_after": 2173018112,
+        "managed_allocated_bytes": 230768160,
+        "safety_score": 0.9943209886550903,
+        "reference_score": 0.997343,
+        "score_delta": 0.0030220113449096475,
+        "strategy": "Auto"
+      },
+      {
+        "model": "Q4_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q4_0.gguf",
+        "file_bytes": 1934670400,
+        "load_seconds": 0.0985131,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 10.478901793148273,
+        "decode_tokens_per_second": 1.1723097162553286,
+        "rss_bytes_before": 345628672,
+        "rss_bytes_after": 2302300160,
+        "managed_allocated_bytes": 236457104,
+        "safety_score": 0.9987539052963257,
+        "reference_score": 0.997343,
+        "score_delta": 0.001410905296325704,
+        "strategy": "Auto"
+      },
+      {
+        "model": "Q4_1",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q4_1.gguf",
+        "file_bytes": 2148973120,
+        "load_seconds": 0.5494372,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 8.027103280662613,
+        "decode_tokens_per_second": 1.052114450851164,
+        "rss_bytes_before": 367714304,
+        "rss_bytes_after": 2488172544,
+        "managed_allocated_bytes": 228018984,
+        "safety_score": 0.9963662624359131,
+        "reference_score": 0.997343,
+        "score_delta": 0.0009767375640868936,
+        "strategy": "Auto"
+      },
+      {
+        "model": "Q5_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q5_0.gguf",
+        "file_bytes": 2363275840,
+        "load_seconds": 0.3020455,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 10.481212701408378,
+        "decode_tokens_per_second": 0.7629692784411652,
+        "rss_bytes_before": 339226624,
+        "rss_bytes_after": 2737074176,
+        "managed_allocated_bytes": 227809728,
+        "safety_score": 0.9971511960029602,
+        "reference_score": 0.997343,
+        "score_delta": 0.00019180399703977447,
+        "strategy": "Auto"
+      },
+      {
+        "model": "Q5_1",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q5_1.gguf",
+        "file_bytes": 2577578560,
+        "load_seconds": 0.3551489,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 8.109662842557414,
+        "decode_tokens_per_second": 0.881629415142254,
+        "rss_bytes_before": 373796864,
+        "rss_bytes_after": 2919399424,
+        "managed_allocated_bytes": 228372896,
+        "safety_score": 0.9974634647369385,
+        "reference_score": 0.997343,
+        "score_delta": 0.00012046473693849702,
+        "strategy": "Auto"
+      },
+      {
+        "model": "Q8_0",
+        "path": "/home/user/models/shieldstral/Shieldstral-1.0-3B-Q8_0.gguf",
+        "file_bytes": 3649092160,
+        "load_seconds": 0.2292907,
+        "prefill_tokens": 299,
+        "prefill_tokens_per_second": 7.637344550983273,
+        "decode_tokens_per_second": 3.156926391210107,
+        "rss_bytes_before": 341819392,
+        "rss_bytes_after": 4050128896,
+        "managed_allocated_bytes": 228224808,
+        "safety_score": 0.9974151849746704,
+        "reference_score": 0.997343,
+        "score_delta": 7.218497467043061E-05,
+        "strategy": "Auto"
+      }
+    ]
+  }
+}

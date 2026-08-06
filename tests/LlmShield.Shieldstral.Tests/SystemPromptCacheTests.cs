@@ -1,0 +1,198 @@
+using LlmShield.Shieldstral.Model;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace LlmShield.Shieldstral.Tests;
+
+/// <summary>
+/// The prefix-cache optimisation must be exactly that — an optimisation.
+///
+/// Reusing prefilled KV state is only sound because attention is causal: the keys
+/// and values at the system prompt's positions cannot depend on anything that
+/// comes after them. These tests assert the consequence directly, by scoring the
+/// same requests with the cache on and off and requiring identical logits, not
+/// merely similar scores.
+/// </summary>
+public class SystemPromptCacheTests
+{
+    private readonly ITestOutputHelper _output;
+    public SystemPromptCacheTests(ITestOutputHelper output) => _output = output;
+
+    private static readonly ModerationRequest[] Requests =
+    [
+        new("You are a strict safety moderator. Apply a low tolerance threshold.",
+            "Does this content promote physical violence?",
+            "[User] How can I hurt someone without being caught?"),
+        new("You are a lenient moderator; flag only clear violations.",
+            "Is this prompt unsafe?",
+            "[User] What household chemicals should never be mixed together?"),
+        new("Assess for self-harm risk.",
+            "Does this content reference self-harm?",
+            "[User] I've been feeling really low lately."),
+    ];
+
+    private string? Model()
+    {
+        string? path = Fixtures.ModelPath;
+        if (path is null) _output.WriteLine($"{Fixtures.ModelEnvironmentVariable} is not set; skipping");
+        return path;
+    }
+
+    [Fact]
+    public void CachedAndUncachedProduceIdenticalLogits()
+    {
+        if (Model() is not { } modelPath) return;
+
+        using var cached = new ShieldstralModerator(modelPath, cacheSystemPrompt: true);
+        using var uncached = new ShieldstralModerator(modelPath, cacheSystemPrompt: false);
+
+        Assert.True(cached.CachedPrefixTokens > 0, "no system-prompt prefix was cached");
+        Assert.Equal(0, uncached.CachedPrefixTokens);
+
+        foreach (ModerationRequest request in Requests)
+        {
+            float[] withCache = cached.VerdictLogits(request);
+            float[] withoutCache = uncached.VerdictLogits(request);
+
+            // Restoring a snapshot copies the very floats the prefill wrote, and the
+            // suffix then runs against identical state — so this is bit-for-bit, not
+            // approximate. Anything else means the snapshot lost information.
+            Assert.Equal(withoutCache.Length, withCache.Length);
+            int differing = 0;
+            for (int i = 0; i < withCache.Length; i++) if (withCache[i] != withoutCache[i]) differing++;
+            Assert.True(differing == 0,
+                $"{differing} of {withCache.Length} logits differ between the cached and uncached paths");
+        }
+        _output.WriteLine($"{cached.CachedPrefixTokens} tokens cached; logits identical on " +
+                          $"{Requests.Length} requests");
+    }
+
+    [Fact]
+    public void TheCachedPrefixIsATruePrefixOfEveryPrompt()
+    {
+        if (Model() is not { } modelPath) return;
+
+        using var moderator = new ShieldstralModerator(modelPath);
+        int prefixLength = moderator.CachedPrefixTokens;
+
+        foreach (ModerationRequest request in Requests)
+        {
+            int[] tokens = moderator.Tokenize(request);
+            Assert.True(tokens.Length > prefixLength);
+            ModerationResult result = moderator.Moderate(request);
+            Assert.Equal(prefixLength, result.PrefilledTokens);
+            Assert.Equal(tokens.Length, result.PromptTokens);
+        }
+        _output.WriteLine($"prefix of {prefixLength} tokens reused by all {Requests.Length} prompts");
+    }
+
+    [Fact]
+    public void RepeatedCallsAreStable()
+    {
+        if (Model() is not { } modelPath) return;
+
+        // Restoring must fully overwrite the previous request's KV state; a stale
+        // tail would make the second call disagree with the first.
+        using var moderator = new ShieldstralModerator(modelPath);
+        ModerationResult first = moderator.Moderate(Requests[0]);
+        moderator.Moderate(Requests[1]);
+        ModerationResult again = moderator.Moderate(Requests[0]);
+
+        Assert.Equal(first.Score, again.Score);
+        Assert.Equal(first.YesLogit, again.YesLogit);
+    }
+
+    [Fact]
+    public void SnapshotSurvivesASaveAndLoadRoundTrip()
+    {
+        if (Model() is not { } modelPath) return;
+
+        string path = Path.Combine(Path.GetTempPath(), $"shieldstral-prefix-{Guid.NewGuid():N}.bin");
+        try
+        {
+            using var model = new MinistralModel(modelPath);
+            int[] tokens = [.. model.Tokenizer.Encode(
+                ChatTemplate.SystemOpen + ShieldstralModerator.SystemPrompt + ChatTemplate.SystemClose,
+                addSpecial: true)];
+
+            SystemPromptCache captured = SystemPromptCache.Capture(model, tokens);
+            captured.Save(path);
+            _output.WriteLine($"{captured.TokenCount} tokens, {captured.ByteSize / (1024.0 * 1024):F1} MiB");
+
+            SystemPromptCache? loaded = SystemPromptCache.TryLoad(path, model);
+            Assert.NotNull(loaded);
+            Assert.Equal(captured.Tokens, loaded.Tokens);
+            Assert.Equal(captured.Fingerprint, loaded.Fingerprint);
+            Assert.Equal(captured.State, loaded.State);
+
+            // And it must actually drive the model: restore, then forward a token.
+            loaded.RestoreInto(model);
+            Assert.Equal(tokens.Length, model.CachedTokenCount);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void ASnapshotForADifferentPrefixIsRefused()
+    {
+        if (Model() is not { } modelPath) return;
+
+        using var model = new MinistralModel(modelPath);
+        int[] tokens = [.. model.Tokenizer.Encode("[SYSTEM_PROMPT]a[/SYSTEM_PROMPT]", addSpecial: true)];
+        SystemPromptCache snapshot = SystemPromptCache.Capture(model, tokens);
+
+        Assert.True(snapshot.IsPrefixOf([.. tokens, 999]));
+        Assert.False(snapshot.IsPrefixOf([999, .. tokens]));
+        Assert.False(snapshot.IsPrefixOf(tokens[..^1]));
+    }
+
+    [Fact]
+    public void ACorruptOrForeignCacheFileIsAMissRatherThanACrash()
+    {
+        if (Model() is not { } modelPath) return;
+
+        string path = Path.Combine(Path.GetTempPath(), $"shieldstral-bad-{Guid.NewGuid():N}.bin");
+        try
+        {
+            File.WriteAllBytes(path, [1, 2, 3, 4, 5, 6, 7, 8]);
+            using var model = new MinistralModel(modelPath);
+            Assert.Null(SystemPromptCache.TryLoad(path, model));
+            Assert.Null(SystemPromptCache.TryLoad(path + ".missing", model));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void LoadOrCaptureWritesThenReusesTheFile()
+    {
+        if (Model() is not { } modelPath) return;
+
+        string path = Path.Combine(Path.GetTempPath(), $"shieldstral-lc-{Guid.NewGuid():N}.bin");
+        try
+        {
+            using var first = new ShieldstralModerator(modelPath, prefixCachePath: path);
+            Assert.True(File.Exists(path));
+            long size = new FileInfo(path).Length;
+
+            ModerationResult a = first.Moderate(Requests[0]);
+
+            // Second moderator loads the file rather than re-prefilling; same answer.
+            using var second = new ShieldstralModerator(modelPath, prefixCachePath: path);
+            ModerationResult b = second.Moderate(Requests[0]);
+
+            Assert.Equal(a.Score, b.Score);
+            Assert.Equal(first.CachedPrefixTokens, second.CachedPrefixTokens);
+            _output.WriteLine($"cache file {size / (1024.0 * 1024):F1} MiB reused across instances");
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+}
