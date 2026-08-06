@@ -14,24 +14,31 @@ public static class Kernels
 {
     /// <summary>
     /// RMS norm: <c>y = x / sqrt(mean(x^2) + eps) * weight</c>.
-    /// The mean is accumulated in double because a 3072-wide reduction in float
-    /// drifts enough to move a borderline safety score in the last decimal.
     /// </summary>
+    /// <remarks>
+    /// The sum of squares uses two independent vector accumulators and widens to
+    /// double at the end. Two accumulators halve the FMA dependency chain and, more
+    /// to the point, halve the length of each running float32 sum — this reduction
+    /// runs over 3072 elements and its result is multiplied back into every one of
+    /// them, so drift here is not local.
+    /// </remarks>
     public static void RmsNorm(ReadOnlySpan<float> x, ReadOnlySpan<float> weight, float eps, Span<float> y)
     {
         int n = x.Length;
         double sum = 0;
         int i = 0;
         int width = Vector<float>.Count;
-        if (Vector.IsHardwareAccelerated && n >= width)
+        if (Vector.IsHardwareAccelerated && n >= 2 * width)
         {
-            var acc = Vector<float>.Zero;
-            for (; i + width <= n; i += width)
+            Vector<float> even = Vector<float>.Zero, odd = Vector<float>.Zero;
+            for (; i + 2 * width <= n; i += 2 * width)
             {
-                var v = new Vector<float>(x.Slice(i, width));
-                acc += v * v;
+                var a = new Vector<float>(x.Slice(i, width));
+                var b = new Vector<float>(x.Slice(i + width, width));
+                even += a * a;
+                odd += b * b;
             }
-            sum = Vector.Sum(acc);
+            sum = (double)Vector.Sum(even) + Vector.Sum(odd);
         }
         for (; i < n; i++) sum += (double)x[i] * x[i];
 
@@ -81,24 +88,37 @@ public static class Kernels
         TensorPrimitives.Multiply(destination, up, destination);
     }
 
-    /// <summary>In-place softmax over the whole span, max-shifted for stability.</summary>
+    /// <summary>
+    /// In-place softmax, max-shifted for stability.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not <c>TensorPrimitives.SoftMax</c>: that one evaluates
+    /// <c>exp(x) / Σexp(x)</c> without subtracting the maximum first. Attention
+    /// scores in this model reach the 90s in the deepest layers, <c>exp</c>
+    /// overflows to infinity there, and the division then yields NaN for exactly
+    /// the positions that mattered most. Subtracting the max costs one extra pass
+    /// and makes the range irrelevant.
+    /// </remarks>
     public static void Softmax(Span<float> x)
     {
         if (x.Length == 0) return;
+
+        float max = TensorPrimitives.Max(x);
 
         // An entirely masked-out row divides 0 by 0 and poisons every later layer
         // with NaN. A causal mask never produces one — each query always attends to
         // itself — but a caller-supplied mask might, and a uniform distribution is
         // the answer that keeps the failure local.
-        if (!TensorPrimitives.Max(x).IsFinite())
+        if (!float.IsFinite(max))
         {
             x.Fill(1f / x.Length);
             return;
         }
-        TensorPrimitives.SoftMax(x, x);
-    }
 
-    private static bool IsFinite(this float value) => float.IsFinite(value);
+        TensorPrimitives.Subtract(x, max, x);
+        TensorPrimitives.Exp(x, x);
+        TensorPrimitives.Divide(x, TensorPrimitives.Sum(x), x);
+    }
 
     /// <summary>
     /// <c>destination += scale * source</c>, the accumulation step of attention's

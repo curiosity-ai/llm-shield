@@ -78,6 +78,13 @@ public class ModerationScoreTests
             ModerationResult result = moderator.Moderate(c.Instruct, c.Query, c.Document);
 
             Assert.Equal(c.Tokens, result.PromptTokens);
+            // A non-finite logit means something overflowed upstream; the score would
+            // then be NaN, which compares false against everything and could otherwise
+            // slip past a tolerance check.
+            Assert.True(float.IsFinite(result.YesLogit) && float.IsFinite(result.NoLogit),
+                $"{c.Name}: verdict logits are yes={result.YesLogit} no={result.NoLogit}");
+            Assert.True(float.IsFinite(result.Score) && result.Score is >= 0f and <= 1f,
+                $"{c.Name}: score {result.Score} is not a probability");
 
             double deltaNumpy = Math.Abs(result.Score - c.Score);
             worstNumpy = Math.Max(worstNumpy, deltaNumpy);

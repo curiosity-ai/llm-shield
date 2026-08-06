@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using LlmShield.Shieldstral;
 using LlmShield.Shieldstral.Gguf;
 using LlmShield.Shieldstral.Model;
@@ -40,6 +41,16 @@ internal static class Program
             return 1;
         }
     }
+
+    /// <summary>
+    /// Named literals so a run that produced Infinity or NaN still writes a file
+    /// you can look at — the whole point of `dump` is diagnosing exactly that.
+    /// </summary>
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals,
+    };
 
     private static int Unknown(string verb)
     {
@@ -114,7 +125,7 @@ internal static class Program
                 prefilled_tokens = result.PrefilledTokens,
                 load_ms = load.TotalMilliseconds,
                 inference_ms = elapsed.TotalMilliseconds,
-            }, new JsonSerializerOptions { WriteIndented = true }));
+            }, JsonOptions));
         }
         else
         {
@@ -226,7 +237,7 @@ internal static class Program
             tokens,
             tensors = sink.Tensors,
             logits = new { top20, values },
-        }, new JsonSerializerOptions { WriteIndented = true }));
+        }, JsonOptions));
         Console.WriteLine($"wrote {args[2]} ({sink.Tensors.Count} tensors, {tokens.Length} tokens)");
         return 0;
     }

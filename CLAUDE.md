@@ -79,6 +79,15 @@ produce bit-identical logits, and the tests assert that over all 131072 values
 rather than over the score.
 → `SystemPromptCacheTests.CachedAndUncachedProduceIdenticalLogits`
 
+**Softmax subtracts the maximum; `TensorPrimitives.SoftMax` does not.** That one
+evaluates `exp(x) / Σexp(x)` directly. Attention scores here reach the 90s in the
+deepest layers, `exp` overflows float32, and the division returns NaN — for the
+positions that mattered most, in layer 24 of 26, on prompts long enough to have
+sharp attention. It survives short prompts and shallow layers, which is precisely
+what makes it dangerous. `Kernels.Softmax` does the max-shift; do not "simplify"
+it back.
+→ `KernelTests.SoftmaxSurvivesLargeLogits`
+
 ## Testing
 
 ```bash

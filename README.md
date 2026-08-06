@@ -127,6 +127,18 @@ exact prefix tokens; a mismatch is refused rather than silently applied. Results
 are bit-identical either way, which the test suite asserts by comparing all
 131072 logits, not just the score.
 
+`shieldstral bench` on a 4-core sandbox VM, Q8_0, ~85-token prompts of which 34
+are the system prompt:
+
+```
+prefix cache off:  11563 ms/request
+prefix cache on :   7082 ms/request   (one-time 5567 ms setup, or 0 if persisted)
+```
+
+The saving tracks the cached fraction of the prompt almost exactly, which is what
+you would expect for a prefill-bound workload — the shorter the caller's content,
+the larger the share the fixed prompt was costing.
+
 ## Validation
 
 Three independent implementations agree on the same six reference cases:
@@ -135,10 +147,14 @@ Three independent implementations agree on the same six reference cases:
 |---|---|---|---|
 | violent-request | 0.997307 | 0.997249 | 0.997343 |
 | benign-cooking | 0.000000 | 0.000000 | 0.000000 |
-| borderline-sarcasm | — see tests | 0.428835 | 0.439276 |
-| borderline-fiction | — see tests | 0.051092 | 0.049938 |
-| borderline-lenient | — see tests | 0.000935 | 0.000885 |
-| borderline-selfharm | — see tests | 0.025491 | 0.025094 |
+| borderline-sarcasm | 0.443099 | 0.428835 | 0.439276 |
+| borderline-fiction | 0.050686 | 0.051092 | 0.049938 |
+| borderline-lenient | 0.000943 | 0.000935 | 0.000885 |
+| borderline-selfharm | 0.025396 | 0.025491 | 0.025094 |
+
+Worst disagreement with llama.cpp on the same quantization: 3.8e-3. Worst against
+the unquantized NumPy run: 1.4e-2, on the most borderline case — which is where
+quantization should show, and it is the only place it does.
 
 `tools/reference_shieldstral.py` is a NumPy implementation that reads the
 original bfloat16 weights and shares no code with the runtime, so agreement is

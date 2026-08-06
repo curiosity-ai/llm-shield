@@ -88,6 +88,8 @@ Reading is complete. Writing is the converter's job and covers what the referenc
 - [x] `TensorPrimitives` for dot/sigmoid/softmax/elementwise; `Vector<T>` for the
       fused shapes it has no single call for
 - [x] Attention parallel over heads, GEMM parallel over row blocks
+- [x] Numerically stable softmax — `TensorPrimitives.SoftMax` skips the max-shift
+      and overflows on this model's layer-24 attention scores
 - [ ] Integer dot products against Q8-quantized activations. Would cut the
       dequantize-then-FMA cost roughly threefold on the legacy and k-quant types;
       the current path is simpler and covers every type uniformly.

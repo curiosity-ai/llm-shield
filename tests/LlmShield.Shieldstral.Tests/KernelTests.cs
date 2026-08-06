@@ -102,6 +102,37 @@ public class KernelTests
         Numeric.Close(expected, actual, 1e-6, $"addScaled({n})");
     }
 
+    /// <summary>
+    /// Attention scores reach the 90s in this model's deepest layers, where
+    /// <c>exp</c> overflows float32. A softmax that does not subtract the maximum
+    /// first returns NaN there — and only there, so it survives short prompts and
+    /// shallow layers and then poisons the residual stream on a real one.
+    /// </summary>
+    [Theory]
+    [InlineData(50f)]
+    [InlineData(95f)]
+    [InlineData(400f)]
+    public void SoftmaxSurvivesLargeLogits(float magnitude)
+    {
+        var x = new float[64];
+        for (int i = 0; i < x.Length; i++) x[i] = magnitude * (i / (float)(x.Length - 1));
+
+        var actual = (float[])x.Clone();
+        Kernels.Softmax(actual);
+
+        Assert.All(actual, v => Assert.True(float.IsFinite(v), $"softmax produced {v}"));
+        Numeric.Close(1.0, actual.Sum(), 1e-5, "softmax total");
+
+        // The largest logit must still dominate, and the shape must be the same as
+        // for the numerically-safe reference.
+        Assert.Equal(x.Length - 1, Array.IndexOf(actual, actual.Max()));
+
+        var expected = new double[x.Length];
+        double sum = 0;
+        for (int i = 0; i < x.Length; i++) { expected[i] = Math.Exp(x[i] - magnitude); sum += expected[i]; }
+        for (int i = 0; i < x.Length; i++) Numeric.Close(expected[i] / sum, actual[i], 1e-5, $"p[{i}]");
+    }
+
     [Fact]
     public void SoftmaxOfAllMaskedPositionsStaysFinite()
     {

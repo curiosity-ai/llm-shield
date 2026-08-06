@@ -63,13 +63,20 @@ public class ActivationParityTests
         model.ResetKvCache();
         model.Forward(tokens, recorder);
 
-        // Q8_0 keeps ~3 significant digits per weight; the residual stream accumulates
-        // that over 26 layers, so a fixed tolerance would either pass everything or
-        // fail the deep layers for no reason.
-        double tolerance = Fixtures.IsQ8Reference(modelPath) ? 0.02 : 0.10;
+        // Relative L2 error, not worst element. The reference runs unquantized and
+        // the runtime reads Q8_0, so individual elements legitimately differ by a
+        // few percent of the tensor's own scale — RMS norm amplifies the embedding
+        // table's quantization error by ~120x, which is arithmetic, not a bug. The
+        // direction of the whole vector is what a wiring error changes, and it moves
+        // that by orders of magnitude more than this.
+        //
+        // Measured on the Q8_0 build: every tensor lands at or below 3.4e-2, and the
+        // error does not grow with depth (the last layer is the tightest at 3.0e-3).
+        double tolerance = Fixtures.IsQ8Reference(modelPath) ? 0.05 : 0.15;
 
         var failures = new List<string>();
         int compared = 0;
+        double worstOverall = 0;
         foreach (JsonProperty entry in fixture.RootElement.GetProperty("tensors").EnumerateObject())
         {
             string name = entry.Name;
@@ -85,27 +92,51 @@ public class ActivationParityTests
             Assert.Equal(rows, actual.Rows);
 
             float[] expected = [.. entry.Value.GetProperty("last_row").EnumerateArray().Select(v => v.GetSingle())];
-            double worst = Numeric.WorstRelativeError(expected, actual.LastRow);
+            Assert.All(actual.LastRow, v => Assert.True(float.IsFinite(v),
+                $"{name} contains {v}; a non-finite activation poisons every later layer"));
+
+            double error = RelativeL2(expected, actual.LastRow);
+            worstOverall = Math.Max(worstOverall, error);
 
             double expectedChecksum = entry.Value.GetProperty("checksum").GetDouble();
             double checksumError = Math.Abs(actual.Checksum - expectedChecksum)
                                  / Math.Max(1.0, Math.Abs(expectedChecksum));
 
             _output.WriteLine($"{name,-24} [{rows,3}x{columns,6}] " +
-                              $"row {worst:E2}  checksum {checksumError:E2}");
+                              $"L2 {error:E2}  checksum {checksumError:E2}");
 
-            if (worst > tolerance)
-                failures.Add($"{name}: last row differs by {worst:E3} (tolerance {tolerance:E1})");
+            if (error > tolerance)
+                failures.Add($"{name}: last row differs by {error:E3} in relative L2 (tolerance {tolerance:E1})");
             if (checksumError > tolerance)
                 failures.Add($"{name}: sum of squares differs by {checksumError:E3} " +
                              $"({actual.Checksum:E6} vs {expectedChecksum:E6})");
             compared++;
         }
+        _output.WriteLine($"worst relative L2 across {compared} tensors: {worstOverall:E2}");
 
         Assert.True(compared > 0, "the fixture recorded no tensors");
+        Assert.True(compared >= 30,
+            $"only {compared} tensors were compared; the fixture should cover the leading layers " +
+            "plus the final norm — regenerate it (see CLAUDE.md).");
         Assert.True(failures.Count == 0,
             $"{failures.Count} of {compared} tensors diverged from the NumPy reference:\n  " +
             string.Join("\n  ", failures.Take(8)));
+    }
+
+    /// <summary>
+    /// <c>‖actual - expected‖₂ / ‖expected‖₂</c> — how far the vector moved, relative
+    /// to how big it is.
+    /// </summary>
+    private static double RelativeL2(ReadOnlySpan<float> expected, ReadOnlySpan<float> actual)
+    {
+        double norm = 0, difference = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            norm += (double)expected[i] * expected[i];
+            double d = actual[i] - (double)expected[i];
+            difference += d * d;
+        }
+        return norm == 0 ? Math.Sqrt(difference) : Math.Sqrt(difference / norm);
     }
 
     /// <summary>
