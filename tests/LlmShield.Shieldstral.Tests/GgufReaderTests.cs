@@ -99,6 +99,7 @@ public class GgufReaderTests
 
             IOException error = Assert.Throws<IOException>(() => new GgufFile(path));
             Assert.Contains("incomplete", error.Message, StringComparison.OrdinalIgnoreCase);
+            AssertNotStillMapped(path);
         }
         finally
         {
@@ -114,11 +115,27 @@ public class GgufReaderTests
         {
             File.WriteAllBytes(path, [0, 1, 2, 3, 4, 5, 6, 7]);
             Assert.Throws<InvalidDataException>(() => new GgufFile(path));
+            AssertNotStillMapped(path);
         }
         finally
         {
             if (File.Exists(path)) File.Delete(path);
         }
+    }
+
+    /// <summary>
+    /// A constructor that throws has to unmap first, because nobody else can — there is no
+    /// instance to dispose. On Windows a mapped file cannot be deleted, and deleting it is
+    /// exactly what the callers that catch these do: <c>ShieldstralModerator.CreateAsync</c>
+    /// removes a corrupt cached model before downloading it again.
+    ///
+    /// Opening for exclusive write is the portable way to ask. It fails on Linux too, where
+    /// .NET backs <see cref="FileShare"/> with an advisory lock, so this catches the leak on
+    /// the machine most of us run the tests on rather than only on the build agent.
+    /// </summary>
+    private static void AssertNotStillMapped(string path)
+    {
+        using var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
     }
 
     [Fact]
