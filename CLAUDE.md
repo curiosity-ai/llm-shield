@@ -24,7 +24,7 @@ src/LlmShield.Shieldstral/
   Numerics/        Kernels.cs, QuantMatMul.cs, WeightMatrix.cs
   Tokenization/    TekkenTokenizer.cs
   Model/           ModelConfig.cs, Rope.cs, KvCache.cs, MinistralModel.cs
-  ChatTemplate.cs, SystemPromptCache.cs, ShieldstralModerator.cs
+  ChatTemplate.cs, SystemPromptCache.cs, ShieldstralModerator.cs, ModelDownloader.cs
 src/LlmShield.Shieldstral.Cli/    the `shieldstral` command
 tests/LlmShield.Shieldstral.Tests/
 tests/fixtures/                   generated oracles (JSON), committed
@@ -78,6 +78,17 @@ space is not cosmetic.
 produce bit-identical logits, and the tests assert that over all 131072 values
 rather than over the score.
 → `SystemPromptCacheTests.CachedAndUncachedProduceIdenticalLogits`
+
+**A file at the download destination is always complete.** Everything else treats
+a path that exists as a file worth memory-mapping, so `ModelDownloader` writes to
+a `.download` sidecar and renames only at the end. Its resume path is the part
+that needs care: a partial file is reused only when the recorded size *and* entity
+tag still match the server, because resuming into a republished model yields a
+GGUF of exactly the right length that is wrong from the resume point on — which no
+loader can detect. models.curiosity.ai answers HEAD with 405, so the size, the
+tag and range support all come from a one-byte ranged GET; drop that fallback and
+nothing fails, downloads just silently stop resuming.
+→ `ModelDownloaderTests`, against a loopback socket rather than the real host
 
 **Softmax subtracts the maximum; `TensorPrimitives.SoftMax` does not.** That one
 evaluates `exp(x) / Σexp(x)` directly. Attention scores here reach the 90s in the
@@ -205,6 +216,16 @@ per matmul. That is well inside the tolerance the model-level tests use, and
 `IntegerDotTests` bounds both the noise and — separately and much more tightly —
 any systematic bias, since an unpacking error shows up as a shift rather than as
 noise.
+
+## Releasing
+
+`.devops/azure-pipelines.yml` builds `main`, runs the tests and pushes
+`LlmShield.Shieldstral` to nuget.org through the `nuget-curiosity-org` service
+connection. Versions are CalVer — `yy.M.<buildId mod 65536>`, stamped by
+`/p:Version` at build time, the modulo because the build counter has to fit an
+int16. `Directory.Build.props` keeps `IsPackable` false, so a new project is not
+published by accident: opt in on the project *and* add a build step, or it will
+never leave the agent.
 
 ## Conventions
 

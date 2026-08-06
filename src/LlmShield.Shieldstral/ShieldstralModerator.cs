@@ -108,6 +108,55 @@ public sealed class ShieldstralModerator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Downloads a published Shieldstral GGUF if it is not already cached, then opens it.
+    ///
+    /// This is the whole deployment story: a GGUF carries the weights, the hyperparameters
+    /// and the vocabulary, so there is no second file to find and nothing to configure.
+    /// A model already on disk is opened without touching the network, which makes this
+    /// safe to call on every start-up.
+    /// </summary>
+    /// <param name="quantization">Which published model to use. Defaults to <see cref="ShieldstralQuantization.Q5_1"/>.</param>
+    /// <param name="modelUrl">Overrides the download URL — for a mirror, or a model you converted yourself.</param>
+    /// <param name="downloadToPath">Where to cache the file. Defaults to <see cref="ModelDownloader.DefaultPathFor"/>.</param>
+    /// <param name="cacheSystemPrompt">See the constructor.</param>
+    /// <param name="prefixCachePath">See the constructor.</param>
+    /// <param name="reportProgress">Optional download progress callback (~2 Hz).</param>
+    /// <param name="cancellationToken">Cancels the download; a partial file is kept and resumes next time.</param>
+    public static async Task<ShieldstralModerator> CreateAsync(
+        ShieldstralQuantization quantization = ShieldstralQuantization.Q5_1,
+        string? modelUrl = null,
+        string? downloadToPath = null,
+        bool cacheSystemPrompt = true,
+        string? prefixCachePath = null,
+        Action<DownloadProgress>? reportProgress = null,
+        CancellationToken cancellationToken = default)
+    {
+        string url = modelUrl ?? ModelDownloader.UrlFor(quantization);
+        string path = downloadToPath ?? ModelDownloader.DefaultPathFor(quantization);
+
+        await ModelDownloader.DownloadFileAsync(url, path, reportProgress, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await OpenAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException or NotSupportedException or KeyNotFoundException)
+        {
+            // The cached file is not a Shieldstral GGUF this build can read. Much the likeliest
+            // cause is a file truncated by an older version, or by something outside this process
+            // writing to the cache directory — so delete it, fetch it once more, and only then
+            // conclude that the model itself is the problem.
+            try { File.Delete(path); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            await ModelDownloader.DownloadFileAsync(url, path, reportProgress, cancellationToken).ConfigureAwait(false);
+            return await OpenAsync().ConfigureAwait(false);
+        }
+
+        // Opening is not I/O-bound — the weights are memory-mapped in milliseconds, but capturing
+        // the system-prompt prefix runs a real prefill. Off the caller's thread it goes.
+        Task<ShieldstralModerator> OpenAsync() => Task.Run(
+            () => new ShieldstralModerator(path, cacheSystemPrompt, prefixCachePath), cancellationToken);
+    }
+
     /// <summary>Scores one request.</summary>
     public ModerationResult Moderate(string instruct, string query, string document)
         => Moderate(new ModerationRequest(instruct, query, document));
