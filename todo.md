@@ -90,12 +90,26 @@ Reading is complete. Writing is the converter's job and covers what the referenc
 - [x] Attention parallel over heads, GEMM parallel over row blocks
 - [x] Numerically stable softmax — `TensorPrimitives.SoftMax` skips the max-shift
       and overflows on this model's layer-24 attention scores
-- [ ] Integer dot products against Q8-quantized activations. Would cut the
-      dequantize-then-FMA cost roughly threefold on the legacy and k-quant types;
-      the current path is simpler and covers every type uniformly.
+- [x] Integer dot products against Q8-quantized activations, for the types with a
+      single per-block scale — `IntegerDot`, selected by `QuantMatMul.Strategy`
+- [x] AVX2 `vpmaddubsw`/`vpmaddwd` kernel with a portable fallback; unpack once
+      per row and reduce once per row, both of which the first attempt got wrong
+      and both of which cost more than the arithmetic itself
+- [ ] Integer kernels for the k-quants. They carry per-sub-block scales, so each
+      family needs its own unpack; the float path covers them correctly today.
 - [ ] Persist the prefix cache next to the model by default rather than opt-in.
 
-## 9. Vision
+## 9. Benchmarks
+
+- [x] Single-execution harness: environment, per-type dequantize throughput,
+      float-vs-integer matmul, end-to-end sweep per strategy (`shieldstral bench`)
+- [x] Adaptive sample length and minimum-of-N, so a one-token matmul is not timed
+      against the scheduler's mood
+- [x] Prefill and decode tokens/s, resident memory and managed allocation per
+      quantization, with the safety score alongside so accuracy loss is visible
+- [ ] Track the numbers over time rather than pasting them into the README
+
+## 10. Vision
 
 - [x] Converter emits the Pixtral tower and projector
 - [x] `[IMG]` placement in the prompt template — `ChatTemplateTests`
@@ -106,7 +120,7 @@ Reading is complete. Writing is the converter's job and covers what the referenc
 Text moderation is complete and validated; the vision path is converted but not
 yet executed. `ShieldstralModerator` is text-only today.
 
-## 10. Documentation
+## 11. Documentation
 
 - [x] `README.md` — what it is, how to convert, how to run
 - [x] `CLAUDE.md` — layout, invariants, how to regenerate fixtures

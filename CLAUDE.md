@@ -95,6 +95,10 @@ dotnet test                                          # no weights needed
 SHIELDSTRAL_MODEL=/path/to/model.gguf dotnet test    # + model-backed parity
 ```
 
+Tests that change `QuantMatMul.Strategy` must restore it — it is process-wide, so
+a leaked setting silently changes every later test in the run. `IntegerDotTests`
+does it in `Dispose`; `KernelTests` uses a `try`/`finally`.
+
 `SHIELDSTRAL_MODEL` may be a `.gguf` or a directory to search. Model-backed tests
 write a line explaining the skip and pass when it is unset — keep that pattern
 for new ones, so a checkout without a 3.4 GiB download stays green.
@@ -103,6 +107,24 @@ Comparisons use `Numeric.Close` (relative error), never xunit's decimal-places
 overload: that one compares rounded strings, so two float32 values a single ULP
 apart can straddle a boundary and "fail" at four decimal places while agreeing to
 seven significant figures.
+
+## Benchmarking
+
+```bash
+dotnet run --project src/LlmShield.Shieldstral.Cli -c Release -- \
+  bench /path/to/models --json benchmark.json
+```
+
+One process does everything: environment, per-type dequantize throughput, the
+float-versus-integer matmul comparison, and an end-to-end sweep over every GGUF
+it finds, once per strategy. That is not a convenience — comparing a number
+measured now against one measured in a separate invocation compares two machine
+states as much as two kernels, and on a shared VM the machine state moves.
+
+Two habits keep the micro-numbers honest: each timed sample repeats the work
+until it spans at least 250 ms (a one-token matmul takes a few milliseconds, and
+timing that directly measures the scheduler), and the reported figure is the
+*fastest* sample, since everything that makes a run slower is noise.
 
 ## Regenerating fixtures
 
@@ -137,15 +159,45 @@ last row is the one every downstream value depends on.
 
 The hot loop is `QuantMatMul.Forward`. Its shape is deliberate: weights dominate
 both the memory traffic and the decode cost, so each weight row is touched once
-per call and decoded into an L1-resident scratch buffer while every token in the
-current tile dots against it. Tiling the tokens (`TokenTileBytes`) is what keeps
-a long prompt from re-streaming the activations once per output row. Changing the
-loop order will usually make it slower; measure with `shieldstral bench`.
+per call and, in the float path, decoded into an L1-resident scratch buffer while
+every token in the current tile dots against it. Tiling the tokens
+(`TokenTileBytes`) is what keeps a long prompt from re-streaming the activations
+once per output row. Changing the loop order will usually make it slower; measure
+with `shieldstral bench`.
 
-The obvious remaining win is integer dot products against Q8-quantized
-activations, roughly a threefold cut on the legacy and k-quant types. It is not
-done because the current path handles all thirty-odd types uniformly, and
-correctness across every type was the priority.
+There are two arithmetic paths, selected by `QuantMatMul.Strategy`:
+
+- **Float** decodes each weight to float32 and uses `TensorPrimitives.Dot`. Works
+  for every one of the thirty-odd types.
+- **Integer** quantizes the activations to Q8_0 and multiplies in 8 bits. Only
+  for types with a single scale (plus optional offset) per 32-weight block —
+  `IntegerDot.Supports` is the predicate. The k-quants and i-quants carry
+  per-sub-block scales and stay on the float path.
+
+`Auto` picks integer where there is a kernel. Three details in that kernel are
+load-bearing, and each was worth a measurable amount when it was missing:
+
+1. **Unpack once per row, dot once per (row, token).** Unpacking nibbles is per
+   *weight* work. Fusing it into the dot makes a 64-token prefill unpack the same
+   row 64 times, which is enough on its own to lose to the float path.
+2. **One horizontal reduction per row, not per block.** Accumulate into a
+   `Vector256<float>` across blocks. A shuffle chain every 32 weights costs about
+   as much as the multiply it is reducing.
+3. **`vpmaddubsw` + `vpmaddwd`** (`Avx2.MultiplyAddAdjacent`) do 32 8-bit MACs in
+   two instructions. Widening to 16 and then 32 bits by hand costs as much as
+   just doing float FMAs, so without these the integer path has no advantage at
+   all on AVX2. The first operand must be unsigned, hence the `|w| · sign(w)·a`
+   trick — and that is also why activations clamp to ±127, so every pairwise sum
+   stays inside int16.
+
+Q8_0 skips the unpack entirely (`DotPackedQ8_0`) since its payload is already
+plain int8.
+
+The cost is accuracy: quantizing activations adds about 3e-3 of relative L2 error
+per matmul. That is well inside the tolerance the model-level tests use, and
+`IntegerDotTests` bounds both the noise and — separately and much more tightly —
+any systematic bias, since an unpacking error shows up as a shift rather than as
+noise.
 
 ## Conventions
 

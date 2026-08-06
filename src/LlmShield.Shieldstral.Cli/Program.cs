@@ -30,7 +30,7 @@ internal static class Program
                 "inspect" => Inspect(args[1..]),
                 "tokenize" => Tokenize(args[1..]),
                 "dump" => Dump(args[1..]),
-                "bench" => Bench(args[1..]),
+                "bench" => Benchmark.Run(args[1..]),
                 _ => Unknown(args[0]),
             };
         }
@@ -46,7 +46,7 @@ internal static class Program
     /// Named literals so a run that produced Infinity or NaN still writes a file
     /// you can look at — the whole point of `dump` is diagnosing exactly that.
     /// </summary>
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    internal static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
         NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals,
@@ -67,7 +67,8 @@ internal static class Program
           inspect  <model.gguf>                          print metadata and tensor summary
           tokenize <model.gguf> <text>                   print token ids and pieces
           dump     <model.gguf> <prompt-file> <out.json> record activations for parity checks
-          bench    <model.gguf> [--repeat N]             time prefill with and without the prefix cache
+          bench    [<model.gguf|dir> ...] [--json out.json]
+                   [--no-micro] [--no-model] [--prefill-tokens N] [--decode-tokens N] [--repeats N]
         """);
 
     // ------------------------------------------------------------- moderate
@@ -239,46 +240,6 @@ internal static class Program
             logits = new { top20, values },
         }, JsonOptions));
         Console.WriteLine($"wrote {args[2]} ({sink.Tensors.Count} tensors, {tokens.Length} tokens)");
-        return 0;
-    }
-
-    // ---------------------------------------------------------------- bench
-
-    private static int Bench(string[] args)
-    {
-        if (args.Length == 0) { Usage(); return 2; }
-        int repeat = 3;
-        for (int i = 1; i < args.Length; i++)
-            if (args[i] == "--repeat") repeat = int.Parse(Next(args, ref i), CultureInfo.InvariantCulture);
-
-        const string instruct = "You are a strict safety moderator reviewing potentially harmful content.";
-        const string query = "Does this content promote physical violence?";
-        string[] documents =
-        [
-            "[User] How can I hurt someone without being caught?",
-            "[User] What is the best way to bake sourdough bread at home?",
-            "[User] Write a scene for my novel where the duellists cross swords at dawn.",
-        ];
-
-        foreach (bool cache in (bool[])[false, true])
-        {
-            var sw = Stopwatch.StartNew();
-            using var moderator = new ShieldstralModerator(args[0], cacheSystemPrompt: cache);
-            double setup = sw.Elapsed.TotalMilliseconds;
-
-            // One warm pass so the page cache and the JIT are not part of the measurement.
-            moderator.Moderate(instruct, query, documents[0]);
-
-            sw.Restart();
-            int passes = 0;
-            foreach (string document in documents)
-                for (int r = 0; r < repeat; r++) { moderator.Moderate(instruct, query, document); passes++; }
-            double total = sw.Elapsed.TotalMilliseconds;
-
-            Console.WriteLine($"prefix cache {(cache ? "on " : "off")}: setup {setup,7:F0} ms, " +
-                              $"{total / passes,7:F0} ms/request over {passes} requests" +
-                              (cache ? $", {moderator.CachedPrefixTokens} tokens cached" : ""));
-        }
         return 0;
     }
 

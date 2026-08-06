@@ -82,7 +82,8 @@ dotnet run --project src/LlmShield.Shieldstral.Cli -c Release -- \
 
 `--json` emits a machine-readable result; `--document-file` or stdin takes the
 content from a file. `inspect` prints a GGUF's metadata and tensor breakdown,
-`tokenize` shows token ids and pieces, `bench` times the prefix cache.
+`tokenize` shows token ids and pieces, `dump` records per-layer activations for
+the parity harness, and `bench` runs the benchmark suite.
 
 ## Quantization support
 
@@ -127,17 +128,11 @@ exact prefix tokens; a mismatch is refused rather than silently applied. Results
 are bit-identical either way, which the test suite asserts by comparing all
 131072 logits, not just the score.
 
-`shieldstral bench` on a 4-core sandbox VM, Q8_0, ~85-token prompts of which 34
-are the system prompt:
-
-```
-prefix cache off:  11563 ms/request
-prefix cache on :   7082 ms/request   (one-time 5567 ms setup, or 0 if persisted)
-```
-
-The saving tracks the cached fraction of the prompt almost exactly, which is what
-you would expect for a prefill-bound workload — the shorter the caller's content,
-the larger the share the fixed prompt was costing.
+On a 4-core sandbox VM with Q8_0 and ~85-token prompts, of which 34 are the
+system prompt, this cut 11.6 s/request to 7.1 s (one-time 5.6 s setup, or zero if
+persisted). The saving tracks the cached fraction of the prompt almost exactly,
+which is what you would expect for a prefill-bound workload — the shorter the
+caller's content, the larger the share the fixed prompt was costing.
 
 ## Validation
 
@@ -172,6 +167,75 @@ SHIELDSTRAL_MODEL=/path/to/model.gguf dotnet test   # plus the model-backed pari
 
 Without `SHIELDSTRAL_MODEL` the model-backed tests report why they skipped and
 pass, so a checkout without a 3.4 GiB download still runs the rest.
+
+## Performance
+
+Two arithmetic paths, chosen per weight type by `QuantMatMul.Strategy`:
+
+- **Float** decodes each weight to float32 and uses `TensorPrimitives.Dot`. Works
+  for every type.
+- **Integer** quantizes the activations to Q8_0 and multiplies in 8 bits, using
+  AVX2's `vpmaddubsw`/`vpmaddwd` where available. Only for types with a single
+  scale (plus optional offset) per 32-weight block: Q8_0, Q5_1, Q5_0, Q4_1, Q4_0.
+
+`Auto` — the default — takes the integer path where there is a kernel and falls
+back to float otherwise.
+
+### Quantization sweep
+
+One `shieldstral bench` execution, 4-core sandbox VM (no AVX-512), .NET 10,
+256-token prefill, 8 decode tokens, median of 3. `score` is the safety verdict
+for the `violent-request` reference case, where llama.cpp gives **0.997343**.
+
+| build | size | prefill tok/s | decode tok/s | RSS | score |
+|---|---|---|---|---|---|
+| | | float → **auto** | float → **auto** | | float → **auto** |
+| Q8_0 | 3.40 GiB | 7.1 → **7.6** | 0.98 → **3.16** | 3.8 GiB | 0.997307 → **0.997415** |
+| Q5_1 | 2.40 GiB | 7.0 → **8.1** | 0.63 → **0.88** | 2.7 GiB | 0.997395 → **0.997463** |
+| Q5_0 | 2.20 GiB | 6.9 → **10.5** | 0.66 → **0.76** | 2.6 GiB | 0.996971 → **0.997151** |
+| Q4_1 | 2.00 GiB | 7.2 → **8.0** | 0.81 → **1.05** | 2.3 GiB | 0.996204 → **0.996366** |
+| Q4_0 | 1.80 GiB | 7.0 → **10.5** | 0.83 → **1.17** | 2.1 GiB | 0.998687 → **0.998754** |
+| MXFP4 | 1.70 GiB | 7.1 → 7.0 | 0.92 → 0.92 | 2.0 GiB | 0.994321 |
+| TQ2_0 | 0.83 GiB | 7.2 → 6.9 | 0.67 → 0.66 | 1.2 GiB | **0.030626** |
+
+Managed allocation is ~220 MiB per run regardless of build: the weights are
+memory-mapped, so RSS tracks the file size and is page cache the kernel can
+reclaim, not private memory the process is holding.
+
+Three things worth reading off that table:
+
+- **The integer path is worth keeping.** 1.07–1.52× on prefill and 1.15–3.22× on
+  decode for the five types it covers, and the two it does not are unchanged —
+  they fall through to float, as intended. The verdict moves by at most 2e-4,
+  which is an order of magnitude below the difference between two quantizations
+  of the same weights.
+- **Under the float path, throughput barely depends on model size.** Every build
+  prefills at ~7 tok/s whether it is 0.83 GiB or 3.40 GiB, because the cost is
+  decoding weights to float, not fetching them. That is exactly the bound the
+  integer path removes, and it is why Q8_0 — the *largest* build, but the cheapest
+  to decode — is the fastest at decode once it stops decoding at all (3.16 tok/s,
+  from a `DotPackedQ8_0` kernel that reads the packed row in place).
+- **TQ2_0 is a size record and a broken classifier.** At 0.83 GiB it scores 0.031
+  where every other build says 0.997: ternary quantization is meant for models
+  trained for it, and applying it post-hoc destroys this one. It is in the table
+  because "it loads and runs" is not the same as "it works", and a sweep that
+  only reported tok/s would have hidden that.
+
+### Per-type decode throughput
+
+What the float path pays per weight, single-threaded (`Melem/s` of output):
+
+| | | | | |
+|---|---|---|---|---|
+| F32 3882 | Q8_0 1520 | BF16 1475 | Q4_0 969 | Q4_K 713 |
+| IQ1_S 741 | TQ2_0 744 | Q5_0 743 | Q6_K 354 | F16 386 |
+| IQ2_XXS 192 | IQ2_S 172 | IQ3_XXS 158 | IQ3_S 126 | |
+
+The i-quants are 5–10× slower to decode than the legacy families, which is the
+cost of their codebook indirection. They are supported for completeness; if you
+want small *and* fast, Q4_0 with the integer path is the better trade.
+
+Full machine-readable results are in [`benchmark.json`](benchmark.json).
 
 ## Requirements
 

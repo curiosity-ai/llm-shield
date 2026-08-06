@@ -179,8 +179,26 @@ public class KernelTests
     /// that is what lets the matmul decode rows lazily instead of materialising
     /// the whole matrix.
     /// </summary>
+    /// <remarks>
+    /// Pinned to the float strategy: this is about lazy versus eager decoding, and
+    /// the integer path deliberately introduces activation quantization error.
+    /// <c>IntegerDotTests</c> covers that comparison separately.
+    /// </remarks>
     [Fact]
     public unsafe void QuantMatMulAgreesWithDequantizedWeights()
+    {
+        QuantMatMul.Strategy = MatMulStrategy.Float;
+        try
+        {
+            AssertQuantizedMatchesDequantized();
+        }
+        finally
+        {
+            QuantMatMul.Strategy = MatMulStrategy.Auto;
+        }
+    }
+
+    private static unsafe void AssertQuantizedMatchesDequantized()
     {
         const int rows = 8, cols = 256;
         var rng = new Random(99);
