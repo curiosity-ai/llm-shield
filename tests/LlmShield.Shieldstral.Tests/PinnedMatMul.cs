@@ -28,6 +28,29 @@ internal static class PinnedMatMul
         }
     }
 
+    /// <summary><see cref="QuantMatMul.ForwardRowsAsync"/> against a managed weight buffer.</summary>
+    internal static Task ForwardRowsAsync(
+        GgmlType type, Array weights, int rows, int cols, int[] rowIds,
+        float[] x, int tokens, float[] destination, ParallelOptions? options = null)
+    {
+        var handle = GCHandle.Alloc(weights, GCHandleType.Pinned);
+        return Run(BindRows(handle, type, rows, cols, rowIds, x, tokens, destination, options ?? new ParallelOptions()), handle);
+
+        static async Task Run(Func<ValueTask> work, GCHandle handle)
+        {
+            try { await work().ConfigureAwait(false); }
+            finally { handle.Free(); }
+        }
+    }
+
+    private static unsafe Func<ValueTask> BindRows(
+        GCHandle handle, GgmlType type, int rows, int cols, int[] rowIds,
+        float[] x, int tokens, float[] destination, ParallelOptions options)
+    {
+        var matrix = new WeightMatrix(type, (byte*)handle.AddrOfPinnedObject(), rows, cols);
+        return () => QuantMatMul.ForwardRowsAsync(matrix, rowIds, x, tokens, destination, options);
+    }
+
     private static unsafe Func<ValueTask> Bind(
         GCHandle handle, GgmlType type, int rows, int cols,
         float[] x, int tokens, float[] destination, ParallelOptions options)

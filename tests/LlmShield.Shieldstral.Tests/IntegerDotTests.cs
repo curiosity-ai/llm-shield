@@ -51,11 +51,24 @@ public class IntegerDotTests : IDisposable
         return bytes;
     }
 
-    [Theory]
-    [MemberData(nameof(IntegerTypes))]
-    public async Task IntegerPathAgreesWithFloatPath(GgmlType type)
+    /// <summary>
+    /// 3 tokens run only the GEMM's single-token tail; 13 add three full four-token
+    /// tiles. 100 rows leaves a short final group of four.
+    /// </summary>
+    public static TheoryData<GgmlType, int> IntegerTypesAndTokens()
     {
-        const int rows = 96, cols = 3072, tokens = 3;
+        var data = new TheoryData<GgmlType, int>();
+        foreach (GgmlType type in (GgmlType[])[GgmlType.Q8_0, GgmlType.Q4_0, GgmlType.Q4_1, GgmlType.Q5_0, GgmlType.Q5_1])
+            foreach (int tokens in (int[])[3, 13])
+                data.Add(type, tokens);
+        return data;
+    }
+
+    [Theory]
+    [MemberData(nameof(IntegerTypesAndTokens))]
+    public async Task IntegerPathAgreesWithFloatPath(GgmlType type, int tokens)
+    {
+        const int rows = 100, cols = 3072;
         byte[] weights = QuantizeRows(type, rows, cols, seed: 21);
 
         var x = new float[tokens * cols];

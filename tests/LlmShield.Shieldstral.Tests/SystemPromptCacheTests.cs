@@ -67,6 +67,38 @@ public class SystemPromptCacheTests
                           $"{Requests.Length} requests");
     }
 
+    /// <summary>
+    /// Scoring evaluates only the verdict rows of the LM head. That is a shortcut
+    /// of the same kind as the prefix cache, and held to the same standard: the
+    /// yes/no logits it reports must be exactly the best yes/no entries of the full
+    /// 131072-wide head, not an approximation of them.
+    /// </summary>
+    [Fact]
+    public async Task ScoringReadsExactlyWhatTheFullHeadWouldHave()
+    {
+        if (Model() is not { } modelPath) return;
+
+        using var moderator = await ShieldstralModerator.OpenAsync(modelPath);
+        var tokenizer = moderator.Model.Tokenizer;
+        var yes = new List<int>();
+        var no = new List<int>();
+        for (int id = 0; id < tokenizer.VocabSize; id++)
+        {
+            string piece = tokenizer.Decode(id).Trim().Trim('"', '\'', '.').ToLowerInvariant();
+            if (piece == "yes") yes.Add(id);
+            else if (piece == "no") no.Add(id);
+        }
+
+        foreach (ModerationRequest request in Requests)
+        {
+            ModerationResult result = await moderator.ModerateAsync(request);
+            float[] full = await moderator.VerdictLogitsAsync(request);
+
+            Assert.Equal(yes.Max(id => full[id]), result.YesLogit);
+            Assert.Equal(no.Max(id => full[id]), result.NoLogit);
+        }
+    }
+
     [Fact]
     public async Task TheCachedPrefixIsATruePrefixOfEveryPrompt()
     {
