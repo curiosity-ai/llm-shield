@@ -172,6 +172,45 @@ public class KernelTests
     }
 
     /// <summary>
+    /// Attention's shared-operand kernels against four independent scalar sums.
+    /// 131 is not a multiple of any vector width, so the scalar tail is exercised
+    /// alongside the vector body.
+    /// </summary>
+    [Fact]
+    public void Dot4MatchesFourSeparateDots()
+    {
+        const int n = 131;
+        float[] shared = Random(n, 1);
+        float[][] a = [Random(n, 2), Random(n, 3), Random(n, 4), Random(n, 5)];
+
+        Kernels.Dot4(shared, a[0], a[1], a[2], a[3], out float r0, out float r1, out float r2, out float r3);
+
+        float[] actual = [r0, r1, r2, r3];
+        for (int k = 0; k < 4; k++)
+        {
+            double expected = 0;
+            for (int i = 0; i < n; i++) expected += (double)shared[i] * a[k][i];
+            Numeric.Close(expected, actual[k], 1e-5, $"dot {k}");
+        }
+    }
+
+    [Fact]
+    public void AddScaled4MatchesFourSeparateUpdates()
+    {
+        const int n = 131;
+        float[] source = Random(n, 6);
+        float[][] d = [Random(n, 7), Random(n, 8), Random(n, 9), Random(n, 10)];
+        float[][] before = [.. d.Select(v => v.ToArray())];
+        float[] w = [0.5f, -1.25f, 0f, 3f];
+
+        Kernels.AddScaled4(source, d[0], d[1], d[2], d[3], w[0], w[1], w[2], w[3]);
+
+        for (int k = 0; k < 4; k++)
+            for (int i = 0; i < n; i++)
+                Numeric.Close(before[k][i] + (double)w[k] * source[i], d[k][i], 1e-6, $"d{k}[{i}]");
+    }
+
+    /// <summary>
     /// Capping the fan-out must change only how long the product takes, never what
     /// it is. The row chunks write to disjoint slices of the destination, so the
     /// number of workers cannot reorder any accumulation — and this is what a host

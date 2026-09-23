@@ -140,6 +140,30 @@ public sealed class MinistralModel : IDisposable
         => ForwardAsync(tokens, capture: null, options);
 
     /// <summary>
+    /// Appends <paramref name="tokens"/> like <see cref="ForwardAsync(ReadOnlyMemory{int}, ParallelOptions)"/>,
+    /// but evaluates the LM head only for <paramref name="vocabularyIds"/>: element
+    /// <c>i</c> of the result is the logit of token <c>vocabularyIds[i]</c>.
+    /// <para>
+    /// A verdict needs two logits out of 131072. The full head is a 131072-row
+    /// matmul — a quarter of a gigabyte of weights streamed for one position — so a
+    /// caller that knows which rows it will read should ask for just those. The
+    /// values are bit-identical to the same entries of the full logits.
+    /// </para>
+    /// <para>
+    /// A separate name rather than a <c>ForwardAsync</c> overload: next to the one
+    /// taking an <see cref="IActivationSink"/>, a <c>null</c> second argument would
+    /// convert to either.
+    /// </para>
+    /// </summary>
+    public async ValueTask<float[]> ForwardSelectedAsync(
+        ReadOnlyMemory<int> tokens, ReadOnlyMemory<int> vocabularyIds, ParallelOptions options)
+    {
+        var selected = new float[vocabularyIds.Length];
+        await ForwardAsync(tokens, capture: null, options, computeLogits: true, vocabularyIds, selected).ConfigureAwait(false);
+        return selected;
+    }
+
+    /// <summary>
     /// Runs <paramref name="tokens"/> through the model for their KV state only,
     /// skipping the 131072-row LM head. Used to warm a prefix whose logits nobody
     /// will look at — for Shieldstral that is the fixed system prompt, where the
@@ -157,7 +181,8 @@ public sealed class MinistralModel : IDisposable
         => ForwardAsync(tokens, capture, options, computeLogits: true);
 
     private async ValueTask<ReadOnlyMemory<float>> ForwardAsync(
-        ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options, bool computeLogits)
+        ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options, bool computeLogits,
+        ReadOnlyMemory<int> vocabularyIds = default, float[]? selected = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (tokens.Length == 0) throw new ArgumentException("No tokens to forward.", nameof(tokens));
@@ -223,6 +248,12 @@ public sealed class MinistralModel : IDisposable
             capture?.Observe("final_norm", last.Span, 1, hidden);
 
             WeightMatrix head = _lmHead.IsEmpty ? _tokenEmbeddings : _lmHead;
+            if (selected is not null)
+            {
+                await QuantMatMul.ForwardRowsAsync(head, vocabularyIds, last, 1, selected, options).ConfigureAwait(false);
+                return selected;
+            }
+
             await QuantMatMul.ForwardAsync(head, last, _logits, options).ConfigureAwait(false);
             capture?.Observe("logits", _logits, 1, Config.VocabSize);
 
@@ -293,43 +324,22 @@ public sealed class MinistralModel : IDisposable
             Memory<float> context = contextBuffer.AsMemory(0, seq * qDim);
             KvCache cache = KvCache;
 
-            // Grouped-query attention. Heads are independent, so each rents its own
-            // scores buffer for the duration and no synchronisation is needed. The
-            // pool is what makes that free: a per-head cache on the model would have
-            // to be sized for the widest fan-out any caller ever asks for, and would
-            // pin every one of those buffers for the model's lifetime.
-            await Parallel.ForAsync(0, heads, options, (head, _) =>
+            // Grouped-query attention, one work item per (KV head, run of query
+            // tokens). The query heads sharing a KV head are evaluated together, so
+            // each cached key and value row is loaded once for all of them rather
+            // than once per head. Items write disjoint slices of the context, and
+            // each rents its own scores for the duration: the pool is what makes
+            // that free, where a per-head cache on the model would have to be sized
+            // for the widest fan-out any caller ever asks for, and would pin every
+            // one of those buffers for the model's lifetime.
+            int tokenRuns = (seq + AttentionTokenRun - 1) / AttentionTokenRun;
+            await Parallel.ForAsync(0, kvHeads * tokenRuns, options, (item, _) =>
             {
-                float[] scores = ArrayPool<float>.Shared.Rent(cacheLength);
-                try
-                {
-                    int kvHead = head / group;
-                    ReadOnlySpan<float> keys = cache.KeyHistory(layerIndex, kvHead, cacheLength);
-                    ReadOnlySpan<float> values = cache.ValueHistory(layerIndex, kvHead, cacheLength);
-
-                    for (int t = 0; t < seq; t++)
-                    {
-                        int limit = startPos + t + 1;                      // causal mask
-                        ReadOnlySpan<float> query = q.Span.Slice(t * qDim + head * headDim, headDim);
-                        Span<float> row = scores.AsSpan(0, limit);
-                        for (int p = 0; p < limit; p++)
-                            row[p] = Kernels.Dot(query, keys.Slice(p * headDim, headDim)) * scale;
-                        Kernels.Softmax(row);
-
-                        Span<float> sink = context.Span.Slice(t * qDim + head * headDim, headDim);
-                        sink.Clear();
-                        for (int p = 0; p < limit; p++)
-                        {
-                            float w = row[p];
-                            if (w != 0f) Kernels.AddScaled(sink, values.Slice(p * headDim, headDim), w);
-                        }
-                    }
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(scores);
-                }
-
+                int kvHead = item / tokenRuns;
+                int t0 = item % tokenRuns * AttentionTokenRun;
+                int t1 = Math.Min(t0 + AttentionTokenRun, seq);
+                AttendGroup(cache, layerIndex, kvHead, q.Span, context.Span, t0, t1,
+                            startPos, cacheLength, group, headDim, qDim, scale);
                 return ValueTask.CompletedTask;
             }).ConfigureAwait(false);
 
@@ -341,6 +351,92 @@ public sealed class MinistralModel : IDisposable
         {
             ArrayPool<float>.Shared.Return(contextBuffer);
         }
+    }
+
+    /// <summary>Query tokens per attention work item — enough items to spread a short prompt over every core.</summary>
+    private const int AttentionTokenRun = 16;
+
+    /// <summary>Query heads evaluated per pass over a KV head's cache — the width of <see cref="Kernels.Dot4"/>.</summary>
+    private const int HeadsPerPass = 4;
+
+    /// <summary>
+    /// Causal attention of query tokens <c>[t0, t1)</c> for every query head that
+    /// shares <paramref name="kvHead"/>, written into their slices of the context.
+    /// </summary>
+    /// <remarks>
+    /// Heads go four at a time. A group that is not a multiple of four pads the
+    /// last pass by repeating a real query and sending its scores and output to
+    /// scratch, so every head — padded pass or not — goes through the same
+    /// arithmetic.
+    /// </remarks>
+    private static void AttendGroup(
+        KvCache cache, int layerIndex, int kvHead, ReadOnlySpan<float> q, Span<float> context,
+        int t0, int t1, int startPos, int cacheLength, int group, int headDim, int qDim, float scale)
+    {
+        ReadOnlySpan<float> keys = cache.KeyHistory(layerIndex, kvHead, cacheLength);
+        ReadOnlySpan<float> values = cache.ValueHistory(layerIndex, kvHead, cacheLength);
+
+        float[] scoreBuffer = ArrayPool<float>.Shared.Rent(HeadsPerPass * cacheLength);
+        float[] spillBuffer = ArrayPool<float>.Shared.Rent(headDim);
+        try
+        {
+            for (int t = t0; t < t1; t++)
+            {
+                int limit = startPos + t + 1;                      // causal mask
+                ReadOnlySpan<float> queryRow = q.Slice(t * qDim, qDim);
+                Span<float> contextRow = context.Slice(t * qDim, qDim);
+
+                for (int g0 = 0; g0 < group; g0 += HeadsPerPass)
+                {
+                    int live = Math.Min(HeadsPerPass, group - g0);
+                    int firstHead = kvHead * group + g0;
+
+                    ReadOnlySpan<float> q0 = Head(queryRow, firstHead, 0, live, headDim);
+                    ReadOnlySpan<float> q1 = Head(queryRow, firstHead, 1, live, headDim);
+                    ReadOnlySpan<float> q2 = Head(queryRow, firstHead, 2, live, headDim);
+                    ReadOnlySpan<float> q3 = Head(queryRow, firstHead, 3, live, headDim);
+
+                    Span<float> s0 = scoreBuffer.AsSpan(0, limit);
+                    Span<float> s1 = scoreBuffer.AsSpan(cacheLength, limit);
+                    Span<float> s2 = scoreBuffer.AsSpan(2 * cacheLength, limit);
+                    Span<float> s3 = scoreBuffer.AsSpan(3 * cacheLength, limit);
+
+                    for (int p = 0; p < limit; p++)
+                    {
+                        Kernels.Dot4(keys.Slice(p * headDim, headDim), q0, q1, q2, q3,
+                                     out float r0, out float r1, out float r2, out float r3);
+                        s0[p] = r0 * scale; s1[p] = r1 * scale; s2[p] = r2 * scale; s3[p] = r3 * scale;
+                    }
+                    Kernels.Softmax(s0); Kernels.Softmax(s1); Kernels.Softmax(s2); Kernels.Softmax(s3);
+
+                    Span<float> spill = spillBuffer.AsSpan(0, headDim);
+                    Span<float> c0 = Output(contextRow, spill, firstHead, 0, live, headDim);
+                    Span<float> c1 = Output(contextRow, spill, firstHead, 1, live, headDim);
+                    Span<float> c2 = Output(contextRow, spill, firstHead, 2, live, headDim);
+                    Span<float> c3 = Output(contextRow, spill, firstHead, 3, live, headDim);
+                    c0.Clear(); c1.Clear(); c2.Clear(); c3.Clear();
+
+                    for (int p = 0; p < limit; p++)
+                    {
+                        float w0 = s0[p], w1 = s1[p], w2 = s2[p], w3 = s3[p];
+                        if (w0 == 0f && w1 == 0f && w2 == 0f && w3 == 0f) continue;
+                        Kernels.AddScaled4(values.Slice(p * headDim, headDim), c0, c1, c2, c3, w0, w1, w2, w3);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(scoreBuffer);
+            ArrayPool<float>.Shared.Return(spillBuffer);
+        }
+
+        // A padding slot re-reads the pass's first real query and writes to scratch.
+        static ReadOnlySpan<float> Head(ReadOnlySpan<float> row, int firstHead, int slot, int live, int headDim)
+            => row.Slice((firstHead + (slot < live ? slot : 0)) * headDim, headDim);
+
+        static Span<float> Output(Span<float> row, Span<float> spill, int firstHead, int slot, int live, int headDim)
+            => slot < live ? row.Slice((firstHead + slot) * headDim, headDim) : spill;
     }
 
     private void RotateQueries(Span<float> q, int heads, int headDim, int qDim, int seq, int startPos)

@@ -64,6 +64,8 @@ public sealed class ShieldstralModerator : IDisposable
     private readonly ParallelOptions _options;
     private readonly int[] _yesTokens;
     private readonly int[] _noTokens;
+    /// <summary>The yes ids followed by the no ids: the only LM-head rows a verdict reads.</summary>
+    private readonly int[] _verdictTokens;
     private SystemPromptCache? _prefix;
 
     public MinistralModel Model => _model;
@@ -96,6 +98,7 @@ public sealed class ShieldstralModerator : IDisposable
             if (_yesTokens.Length == 0 || _noTokens.Length == 0)
                 throw new InvalidDataException(
                     "The model's vocabulary has no 'yes'/'no' tokens; this does not look like a Shieldstral checkpoint.");
+            _verdictTokens = [.. _yesTokens, .. _noTokens];
         }
         catch
         {
@@ -226,8 +229,10 @@ public sealed class ShieldstralModerator : IDisposable
     {
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
-        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), options ?? _options).ConfigureAwait(false);
-        return Score(logits.Span, tokens.Length, prefilled);
+        // Only the verdict rows of the LM head: the other 131 thousand logits would
+        // be computed and then never read.
+        float[] logits = await _model.ForwardSelectedAsync(tokens.AsMemory(prefilled), _verdictTokens, options ?? _options).ConfigureAwait(false);
+        return Score(logits, tokens.Length, prefilled);
     }
 
     /// <summary>
@@ -307,23 +312,24 @@ public sealed class ShieldstralModerator : IDisposable
     ///
     /// Rather than scanning the top-k as the model card's snippet does, the yes/no
     /// token ids are resolved once up front and read directly — same answer, but it
-    /// cannot fail on a prompt where neither form makes the top 20, and it costs a
-    /// couple of array lookups instead of a 131072-element partial sort.
+    /// cannot fail on a prompt where neither form makes the top 20, and it means
+    /// the LM head only has to produce those few rows.
     /// </summary>
-    private ModerationResult Score(ReadOnlySpan<float> logits, int promptTokens, int prefilled)
+    /// <param name="verdictLogits">Logits for <see cref="_verdictTokens"/>, in that order.</param>
+    private ModerationResult Score(ReadOnlySpan<float> verdictLogits, int promptTokens, int prefilled)
     {
-        float yes = Best(logits, _yesTokens);
-        float no = Best(logits, _noTokens);
+        float yes = Best(verdictLogits[.._yesTokens.Length]);
+        float no = Best(verdictLogits[_yesTokens.Length..]);
 
         float max = MathF.Max(yes, no);
         float eYes = MathF.Exp(yes - max);
         float eNo = MathF.Exp(no - max);
         return new ModerationResult(eYes / (eYes + eNo), yes, no, promptTokens, prefilled);
 
-        static float Best(ReadOnlySpan<float> values, int[] ids)
+        static float Best(ReadOnlySpan<float> values)
         {
             float best = float.NegativeInfinity;
-            foreach (int id in ids) if (values[id] > best) best = values[id];
+            foreach (float v in values) if (v > best) best = v;
             return best;
         }
     }
