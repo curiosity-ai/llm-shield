@@ -101,6 +101,16 @@ tag and range support all come from a one-byte ranged GET; drop that fallback an
 nothing fails, downloads just silently stop resuming.
 → `ModelDownloaderTests`, against a loopback socket rather than the real host
 
+**A cancelled request leaves the instance usable, and a token is never retained.**
+`ModerateAsync` and `OpenAsync` take a `CancellationToken` that is folded into a
+*copy* of the options for that call. The instance's default `ParallelOptions` are
+kept for its lifetime, so a token placed there cancels every later request that
+does not pass options of its own — which is why `OpenAsync`'s own token exists.
+Cancellation is observed between work chunks and surfaces as
+`OperationCanceledException`; the KV cache only advances once a pass completes,
+and every request re-seats it first, so a half-written pass is never read.
+→ `ModerationCancellationTests`
+
 **Softmax subtracts the maximum; `TensorPrimitives.SoftMax` does not.** That one
 evaluates `exp(x) / Σexp(x)` directly. Attention scores here reach the 90s in the
 deepest layers, `exp` overflows float32, and the division returns NaN — for the
