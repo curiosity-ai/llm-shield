@@ -126,20 +126,29 @@ public sealed class ShieldstralModerator : IDisposable
     /// </param>
     /// <param name="options">
     /// Default fan-out for this instance's scoring. Omit for one worker per core.
+    /// It is kept for the instance's lifetime, so a token it carries cancels every
+    /// later request that does not pass options of its own — to bound only the
+    /// open, use <paramref name="cancellationToken"/> instead.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancels the system-prompt prefill. Not retained: it bounds this call only.
+    /// A cancelled open disposes what it had opened and writes no prefix file.
     /// </param>
     public static ValueTask<ShieldstralModerator> OpenAsync(
         string ggufPath,
         bool cacheSystemPrompt = true,
         string? prefixCachePath = null,
-        ParallelOptions? options = null)
-        => OpenAsync(new MinistralModel(ggufPath), ownsModel: true, cacheSystemPrompt, prefixCachePath, options);
+        ParallelOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => OpenAsync(new MinistralModel(ggufPath), ownsModel: true, cacheSystemPrompt, prefixCachePath, options, cancellationToken);
 
     public static async ValueTask<ShieldstralModerator> OpenAsync(
         MinistralModel model,
         bool ownsModel = false,
         bool cacheSystemPrompt = true,
         string? prefixCachePath = null,
-        ParallelOptions? options = null)
+        ParallelOptions? options = null,
+        CancellationToken cancellationToken = default)
     {
         var moderator = new ShieldstralModerator(model, ownsModel, options ?? new ParallelOptions());
 
@@ -147,10 +156,11 @@ public sealed class ShieldstralModerator : IDisposable
         {
             if (cacheSystemPrompt)
             {
+                using var bound = BoundOptions.For(moderator._options, cancellationToken);
                 ReadOnlyMemory<int> prefix = moderator.BuildSystemPrefixTokens();
                 moderator._prefix = prefixCachePath is null
-                    ? await SystemPromptCache.CaptureAsync(model, prefix, moderator._options).ConfigureAwait(false)
-                    : await SystemPromptCache.LoadOrCaptureAsync(model, prefix, prefixCachePath, moderator._options).ConfigureAwait(false);
+                    ? await SystemPromptCache.CaptureAsync(model, prefix, bound.Options).ConfigureAwait(false)
+                    : await SystemPromptCache.LoadOrCaptureAsync(model, prefix, prefixCachePath, bound.Options).ConfigureAwait(false);
             }
         }
         catch
@@ -177,7 +187,10 @@ public sealed class ShieldstralModerator : IDisposable
     /// <param name="prefixCachePath">See <see cref="OpenAsync(string, bool, string, ParallelOptions)"/>.</param>
     /// <param name="options">Default fan-out for this instance's scoring. Omit for one worker per core.</param>
     /// <param name="reportProgress">Optional download progress callback (~2 Hz).</param>
-    /// <param name="cancellationToken">Cancels the download; a partial file is kept and resumes next time.</param>
+    /// <param name="cancellationToken">
+    /// Cancels the download — a partial file is kept and resumes next time — and the
+    /// system-prompt prefill that follows it.
+    /// </param>
     public static async Task<ShieldstralModerator> CreateAsync(
         ShieldstralQuantization quantization = ShieldstralQuantization.Q5_1,
         string? modelUrl = null,
@@ -210,7 +223,7 @@ public sealed class ShieldstralModerator : IDisposable
         // Mapping the weights is a syscall, but capturing the system-prompt prefix runs a real
         // prefill — that part is bounded by `options` rather than by the caller's thread.
         async Task<ShieldstralModerator> OpenCachedAsync()
-            => await OpenAsync(path, cacheSystemPrompt, prefixCachePath, options).ConfigureAwait(false);
+            => await OpenAsync(path, cacheSystemPrompt, prefixCachePath, options, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -220,18 +233,32 @@ public sealed class ShieldstralModerator : IDisposable
     /// call alone — useful when one caller wants a wider or narrower fan-out than
     /// the instance's default without opening a second model.
     /// </para>
+    /// <para>
+    /// <paramref name="cancellationToken"/> is combined with whatever token the
+    /// options carry; either one cancels. Cancellation is observed between work
+    /// chunks of every matmul and attention loop — at most a few milliseconds of
+    /// work on one core — and surfaces as <see cref="OperationCanceledException"/>.
+    /// A cancelled request leaves the instance usable: the KV cache only advances
+    /// once a forward pass completes, and every request re-seats the cache before
+    /// it runs, so whatever a cancelled pass half-wrote is never read.
+    /// </para>
     /// </summary>
     public ValueTask<ModerationResult> ModerateAsync(
-        string instruct, string query, string document, ParallelOptions? options = null)
-        => ModerateAsync(new ModerationRequest(instruct, query, document), options);
+        string instruct, string query, string document, ParallelOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => ModerateAsync(new ModerationRequest(instruct, query, document), options, cancellationToken);
 
-    public async ValueTask<ModerationResult> ModerateAsync(ModerationRequest request, ParallelOptions? options = null)
+    public async ValueTask<ModerationResult> ModerateAsync(
+        ModerationRequest request, ParallelOptions? options = null, CancellationToken cancellationToken = default)
     {
+        using var bound = BoundOptions.For(options ?? _options, cancellationToken);
+        // Tokenizing a long document is the one step no parallel loop observes.
+        bound.Options.CancellationToken.ThrowIfCancellationRequested();
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
         // Only the verdict rows of the LM head: the other 131 thousand logits would
         // be computed and then never read.
-        float[] logits = await _model.ForwardSelectedAsync(tokens.AsMemory(prefilled), _verdictTokens, options ?? _options).ConfigureAwait(false);
+        float[] logits = await _model.ForwardSelectedAsync(tokens.AsMemory(prefilled), _verdictTokens, bound.Options).ConfigureAwait(false);
         return Score(logits, tokens.Length, prefilled);
     }
 
@@ -239,11 +266,13 @@ public sealed class ShieldstralModerator : IDisposable
     /// Full logits for the verdict position. Exposed for callers that want the
     /// whole distribution (calibration work, or a different scoring rule).
     /// </summary>
-    public async ValueTask<float[]> VerdictLogitsAsync(ModerationRequest request, ParallelOptions? options = null)
+    public async ValueTask<float[]> VerdictLogitsAsync(
+        ModerationRequest request, ParallelOptions? options = null, CancellationToken cancellationToken = default)
     {
+        using var bound = BoundOptions.For(options ?? _options, cancellationToken);
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
-        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), options ?? _options).ConfigureAwait(false);
+        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), bound.Options).ConfigureAwait(false);
         return logits.ToArray();
     }
 
@@ -338,16 +367,55 @@ public sealed class ShieldstralModerator : IDisposable
     /// The single most likely verdict token, decoded. Useful as a sanity check:
     /// anything other than "yes"/"no" means the prompt framing has drifted.
     /// </summary>
-    public async ValueTask<string> TopVerdictTokenAsync(ModerationRequest request, ParallelOptions? options = null)
+    public async ValueTask<string> TopVerdictTokenAsync(
+        ModerationRequest request, ParallelOptions? options = null, CancellationToken cancellationToken = default)
     {
+        using var bound = BoundOptions.For(options ?? _options, cancellationToken);
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
-        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), options ?? _options).ConfigureAwait(false);
+        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), bound.Options).ConfigureAwait(false);
         return _model.Tokenizer.Decode(Kernels.ArgMax(logits.Span));
     }
 
     public void Dispose()
     {
         if (_ownsModel) _model.Dispose();
+    }
+
+    /// <summary>
+    /// A caller's options with a per-call token folded in. A copy, never the
+    /// caller's instance: mutating that would leak the token into every later call
+    /// that shares it. Owns the linked source when both tokens can cancel.
+    /// </summary>
+    private readonly struct BoundOptions : IDisposable
+    {
+        private readonly CancellationTokenSource? _linked;
+
+        public ParallelOptions Options { get; }
+
+        private BoundOptions(ParallelOptions options, CancellationTokenSource? linked)
+        {
+            Options = options;
+            _linked = linked;
+        }
+
+        public static BoundOptions For(ParallelOptions options, CancellationToken cancellationToken)
+        {
+            if (!cancellationToken.CanBeCanceled || cancellationToken == options.CancellationToken)
+                return new BoundOptions(options, null);
+
+            CancellationTokenSource? linked = options.CancellationToken.CanBeCanceled
+                ? CancellationTokenSource.CreateLinkedTokenSource(options.CancellationToken, cancellationToken)
+                : null;
+
+            return new BoundOptions(new ParallelOptions
+            {
+                MaxDegreeOfParallelism = options.MaxDegreeOfParallelism,
+                TaskScheduler = options.TaskScheduler,
+                CancellationToken = linked?.Token ?? cancellationToken,
+            }, linked);
+        }
+
+        public void Dispose() => _linked?.Dispose();
     }
 }
